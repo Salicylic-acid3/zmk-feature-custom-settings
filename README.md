@@ -1059,13 +1059,23 @@ hand-written fixed blob stores. Their implementations are isolated in
 entirely when compatibility is off. A legacy array-default registration fails
 at compile time instead of being silently reinterpreted.
 
-On ARM32, the descriptor shrinks from 52 to 40 bytes, the state from 20 to 16,
-and array state from 36 to 32. Constraints and RPC converter pointers move to
+On ARM32, the descriptor shrinks from 52 to 40 bytes and array state from
+36 to 32. Mutable state is allocated by type (see below). Constraints and RPC converter pointers move to
 immutable metadata; core code uses accessors rather than compatibility fields.
 Core array, keyspace, persistence and Studio RPC functionality remains enabled.
-The fixed-size `zmk_custom_setting_value` **still belongs to the common exchange /
-validation code**, including scalar defaults and constraints. This switch does
-not yet eliminate that 76-byte carrier or the shared scratch values.
+The core always uses an **8-byte ARM32 value view**: `uint8_t type`,
+`uint16_t size`, and a union containing INT32/BOOL or a pointer to
+BYTES/STRING/BEHAVIOR. The two shared read scratch headers total 16 bytes,
+down from 152. Behavior's 12-byte payload remains in typed storage; it is not
+replicated inside every value header.
+
+With compatibility ON, the public `zmk_custom_setting_value` remains the old
+76-byte owning carrier. `src/compat/value_api.c` contains the old entry points and
+`src/compat/value.c` translates their ownership;
+its layout and constructors live in `compat/value.h`. With compatibility OFF,
+the old type and function spellings alias the view API, with no wrappers: scalar defaults and constraints
+also use the single 8-byte definition.
+Static defaults/constraints save Flash, not per-setting RAM.
 
 Use typed array defaults and the standard pooled registration macros instead of
 hand-written descriptors. Use `zmk_custom_setting_constraints()` and the RPC
@@ -1099,3 +1109,84 @@ DYA2's current consumers still use legacy defaults/APIs, so its validation build
 keeps compatibility enabled. Disabling it requires migrating those modules too.
 The test matrix exercises both layouts in native core/Studio/split-peripheral
 suites and provides identical ARM sample settings with compatibility on/off.
+
+### Compact value views and caller-owned buffers
+
+Prefer typed getters, `read_into()` and stable refs for ordinary consumers.
+Use `*_view` when inspecting a value's type or implementing an adapter. These
+APIs use the compact layout with compatibility either ON or OFF.
+
+```c
+char text[17];
+struct zmk_custom_setting_value_view value =
+    ZMK_CUSTOM_SETTING_VIEW_BUFFER(text, sizeof(text));
+int err = zmk_custom_setting_read_view(setting, &value);
+if (!err) {
+    /* text owns the copied STRING, including its terminating NUL. */
+}
+
+/* Runtime input is borrowed only until write_view returns. */
+err = zmk_custom_setting_view_blob(&value, ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING,
+                                   text, 3);
+if (!err) {
+    err = zmk_custom_setting_write_view(setting, &value,
+                                        ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY);
+}
+```
+
+For a copying read, `size` initially means **output capacity**; on success it
+becomes payload length. Reinitialize with `VIEW_BUFFER` before reusing an
+output, especially after reading a different type. INT32/BOOL-only outputs may
+start as `{0}`. STRING needs length + 1 bytes; its reported size excludes NUL.
+For BEHAVIOR, pass an actual `struct zmk_custom_setting_behavior_value` as the
+buffer (or storage aligned for that type). A short or unaligned behavior output
+is rejected; a failed output copy does not remove an array element.
+
+`zmk_custom_setting_with_view()` and `with_default_view()` borrow storage under
+the settings lock. The view and all its pointers expire when the callback
+returns; copy anything needed later and do not invoke settings APIs inside the
+callback. Behavior constructor literals live to the end of their enclosing
+block, or forever at file scope. Do not return or retain a pointer to a local
+constructor literal.
+
+The runtime blob constructor rejects lengths above `UINT16_MAX` before narrowing
+`size_t`; setting capacity and single-frame RPC bounds still apply. The output
+buffer initializer caps capacity to this representable maximum. `VALUE_MAX_SIZE`
+no longer determines the size of a compact value header.
+
+When porting old `read()` calls to compatibility OFF, explicitly provide storage:
+`ZMK_CUSTOM_SETTING_VALUE_LOCAL(name)` provides a transitional maximum-size
+buffer. New code should allocate only its needed payload size and use the view
+API or `read_into()`. Direct assignments into `.bytes_value[]` / `.string_value[]`
+and by-value `.behavior_value` initializers require migration to borrowed input
+pointers. RPC converters still get explicit writable output buffers; their
+callback execution remains outside the settings lock.
+
+These changes reduce real stack use on paths that no longer copy payloads, but
+do not change reserved thread stack sizes. Hardware stack high-water measurement
+is still needed before reducing those reservations.
+
+### Typed mutable state
+
+With compatibility OFF, `zmk_custom_setting_state` is a one-byte flags header.
+The descriptor's existing state pointer addresses a typed object containing
+that header followed by its payload. No second pointer or heap allocation is
+needed. Array parents have only the header; array elements already use dense
+storage and bitsets.
+
+| ARM32 allocation, including flags and padding | Previous OFF | Typed OFF |
+| --- | ---: | ---: |
+| INT32 scalar | 16 B | 8 B |
+| BOOL scalar | 16 B | 2 B |
+| BEHAVIOR scalar | 16 B | 16 B |
+| BYTES/STRING or keyspace slot state | 16 B | 16 B |
+| Array parent flags | 16 B | 1 B |
+
+The 12-byte behavior payload and 12-byte blob node still need storage. Moving
+those into separate pointer-referenced objects would add a pointer without
+saving their payload. Typed adjacent storage instead removes the unused union
+space from small scalar settings. `state.h` contains allocation and accessor
+contracts; `compat/state.h` retains the legacy 20-byte union layout when
+compatibility is ON. Access state through the matching
+`zmk_custom_setting_state_int32/bool/behavior/blob()` accessor while holding the
+settings lock; ordinary consumers should prefer the getter/setter APIs.

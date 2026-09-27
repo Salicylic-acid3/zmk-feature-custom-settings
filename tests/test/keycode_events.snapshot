@@ -56,6 +56,7 @@ PASS: custom_settings_ref_rejects_reused_slot
 PASS: custom_settings_typed_string_array
 PASS: custom_settings_pool_alias_input
 PASS: custom_settings_persist_failure_preserves_ram
+PASS: custom_settings_compact_value_views
 zmk: Welcome to ZMK!
 pressed: position 0 keycode 0x70004
 released: position 0 keycode 0x70004

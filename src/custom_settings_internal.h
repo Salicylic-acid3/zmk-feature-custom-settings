@@ -53,16 +53,16 @@ bool split_array_element_key(const char *name, char *array_key, size_t array_key
 
 /* Keyspace helpers preserve the [user_key NUL][payload] storage format. */
 int keyspace_read_payload(const struct zmk_custom_setting *setting,
-                          struct zmk_custom_setting_value *out_value);
+                          struct zmk_custom_setting_value_view *out_value);
 
 int keyspace_read_into(const struct zmk_custom_setting *setting, void *buf, size_t capacity,
                        size_t *out_size, enum zmk_custom_setting_value_type *out_type);
 
 int keyspace_validate_payload(const struct zmk_custom_setting_keyspace *keyspace,
-                              const struct zmk_custom_setting_value *value);
+                              const struct zmk_custom_setting_value_view *value);
 
 int keyspace_write_blob(const struct zmk_custom_setting *setting, const char *key,
-                        const struct zmk_custom_setting_value *value,
+                        const struct zmk_custom_setting_value_view *value,
                         enum zmk_custom_setting_write_mode mode);
 
 int keyspace_write_raw_payload(const struct zmk_custom_setting *setting, const void *data,
@@ -85,8 +85,8 @@ const char *keyspace_public_key_locked(const struct zmk_custom_setting *setting)
     (CONFIG_ZMK_CUSTOM_SETTINGS_KEY_MAX_LEN + CONFIG_ZMK_CUSTOM_SETTINGS_LARGE_VALUE_MAX_SIZE)
 
 int convert_rpc_bytes_value(const struct zmk_custom_setting *setting,
-                            const struct zmk_custom_setting_value *src,
-                            struct zmk_custom_setting_value *dest,
+                            const struct zmk_custom_setting_value_view *src,
+                            struct zmk_custom_setting_value_view *dest,
                             zmk_custom_setting_rpc_bytes_converter_t converter);
 
 bool setting_uses_blob_store(const struct zmk_custom_setting *setting);
@@ -107,23 +107,27 @@ int blob_store_set_raw(const struct zmk_custom_setting *setting, const void *dat
 
 size_t bounded_strlen(const char *str, size_t max_len);
 
-void copy_value(struct zmk_custom_setting_value *dest, const struct zmk_custom_setting_value *src);
+int copy_value(struct zmk_custom_setting_value_view *dest,
+               const struct zmk_custom_setting_value_view *src);
 
-int value_to_storage(const struct zmk_custom_setting_value *value, const void **data, size_t *len);
+int value_to_storage(const struct zmk_custom_setting_value_view *value, const void **data,
+                     size_t *len);
 
 int setting_storage_name(const struct zmk_custom_setting *setting, char *name, size_t name_size);
 
-const struct zmk_custom_setting_value *effective_value(const struct zmk_custom_setting *setting);
+const struct zmk_custom_setting_value_view *
+effective_value(const struct zmk_custom_setting *setting);
 
 int write_value_locked(const struct zmk_custom_setting *setting,
-                       const struct zmk_custom_setting_value *value,
+                       const struct zmk_custom_setting_value_view *value,
                        enum zmk_custom_setting_write_mode mode);
 
 void raise_setting_changed(const struct zmk_custom_setting *setting,
                            enum zmk_custom_setting_changed_kind kind);
 
-void value_from_raw(struct zmk_custom_setting_value *dest, enum zmk_custom_setting_value_type type,
-                    const void *data, size_t size);
+int value_from_raw(struct zmk_custom_setting_value_view *dest,
+                   enum zmk_custom_setting_value_type type, const void *data, size_t size,
+                   struct zmk_custom_setting_behavior_value *behavior);
 
 int write_bytes_raw(const struct zmk_custom_setting *setting, const void *data, size_t size,
                     enum zmk_custom_setting_write_mode mode);
@@ -137,7 +141,7 @@ struct read_into_context {
     enum zmk_custom_setting_value_type out_type;
     int ret;
 };
-void read_into_visitor(const struct zmk_custom_setting_value *value, void *user_data);
+void read_into_visitor(const struct zmk_custom_setting_value_view *value, void *user_data);
 
 /* Synchronous workspace, borrowed only while holding the settings lock.
  * Chunk input has a longer lifetime and owns a separate buffer. */
@@ -156,3 +160,26 @@ void clear_array_temporary_locked(const struct zmk_custom_setting_array_state *a
 
 int persist_raw_candidate_locked(const struct zmk_custom_setting *setting, const void *data,
                                  size_t size);
+
+/* Static metadata is translated only while legacy ownership is enabled. */
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+struct zmk_custom_setting_value_view value_borrow(const struct zmk_custom_setting_value *value);
+struct zmk_custom_setting_value_view value_output(struct zmk_custom_setting_value *value);
+int value_finish(struct zmk_custom_setting_value *value,
+                 const struct zmk_custom_setting_value_view *view);
+
+int value_check_input(const struct zmk_custom_setting_value *value);
+
+int value_visit(const struct zmk_custom_setting_value_view *view,
+                zmk_custom_setting_value_visitor_t visitor, void *user_data);
+
+#else
+static inline struct zmk_custom_setting_value_view
+value_borrow(const struct zmk_custom_setting_value_view *value) {
+    return *value;
+}
+#endif
+
+int keyspace_payload_view_locked(const struct zmk_custom_setting *setting,
+                                 struct zmk_custom_setting_value_view *out_value,
+                                 struct zmk_custom_setting_behavior_value *behavior);

@@ -190,7 +190,7 @@ int save_array_locked(const struct zmk_custom_setting *array_descriptor) {
 
         const void *data;
         size_t len;
-        struct zmk_custom_setting_value value;
+        struct zmk_custom_setting_value_view value;
         array_value_read(array_descriptor, index, &value);
         ret = value_to_storage(&value, &data, &len);
         if (ret < 0) {
@@ -210,8 +210,9 @@ int save_array_locked(const struct zmk_custom_setting *array_descriptor) {
     return delete_inactive_array_values_locked(array_descriptor, array_size);
 }
 
-int zmk_custom_setting_read_array_by_key(const char *custom_subsystem_id, const char *key,
-                                         uint32_t index, struct zmk_custom_setting_value *value) {
+int zmk_custom_setting_read_array_by_key_view(const char *custom_subsystem_id, const char *key,
+                                              uint32_t index,
+                                              struct zmk_custom_setting_value_view *value) {
     struct zmk_custom_setting setting_storage;
     const struct zmk_custom_setting *setting =
         array_view_find(&setting_storage, custom_subsystem_id, key, index);
@@ -219,13 +220,13 @@ int zmk_custom_setting_read_array_by_key(const char *custom_subsystem_id, const 
         return -ENOENT;
     }
 
-    return zmk_custom_setting_read(setting, value);
+    return zmk_custom_setting_read_view(setting, value);
 }
 
-int zmk_custom_setting_write_array_by_key(const char *custom_subsystem_id, const char *key,
-                                          uint32_t index,
-                                          const struct zmk_custom_setting_value *value,
-                                          enum zmk_custom_setting_write_mode mode) {
+int zmk_custom_setting_write_array_by_key_view(const char *custom_subsystem_id, const char *key,
+                                               uint32_t index,
+                                               const struct zmk_custom_setting_value_view *value,
+                                               enum zmk_custom_setting_write_mode mode) {
     struct zmk_custom_setting setting_storage;
     const struct zmk_custom_setting *setting =
         array_view_find(&setting_storage, custom_subsystem_id, key, index);
@@ -233,13 +234,13 @@ int zmk_custom_setting_write_array_by_key(const char *custom_subsystem_id, const
         return -ENOENT;
     }
 
-    return zmk_custom_setting_write(setting, value, mode);
+    return zmk_custom_setting_write_view(setting, value, mode);
 }
 
-int zmk_custom_setting_write_array_element(const struct zmk_custom_setting *const_setting,
-                                           const struct zmk_custom_setting_value *value,
-                                           uint32_t array_size,
-                                           enum zmk_custom_setting_write_mode mode) {
+int zmk_custom_setting_write_array_element_view(const struct zmk_custom_setting *const_setting,
+                                                const struct zmk_custom_setting_value_view *value,
+                                                uint32_t array_size,
+                                                enum zmk_custom_setting_write_mode mode) {
     if (!const_setting || !value) {
         return -EINVAL;
     }
@@ -254,7 +255,7 @@ int zmk_custom_setting_write_array_element(const struct zmk_custom_setting *cons
         return ret;
     }
 
-    ret = zmk_custom_setting_validate(setting, value);
+    ret = zmk_custom_setting_validate_view(setting, value);
     if (ret < 0) {
         return ret;
     }
@@ -285,9 +286,9 @@ int zmk_custom_setting_write_array_element(const struct zmk_custom_setting *cons
     return ret;
 }
 
-int zmk_custom_setting_array_push_back(const struct zmk_custom_setting *setting,
-                                       const struct zmk_custom_setting_value *value,
-                                       enum zmk_custom_setting_write_mode mode) {
+int zmk_custom_setting_array_push_back_view(const struct zmk_custom_setting *setting,
+                                            const struct zmk_custom_setting_value_view *value,
+                                            enum zmk_custom_setting_write_mode mode) {
     if (!setting || !value || !zmk_custom_setting_is_array(setting)) {
         return -EINVAL;
     }
@@ -309,12 +310,12 @@ int zmk_custom_setting_array_push_back(const struct zmk_custom_setting *setting,
         return -ENOENT;
     }
 
-    return zmk_custom_setting_write_array_element(tail, value, array_size + 1, mode);
+    return zmk_custom_setting_write_array_element_view(tail, value, array_size + 1, mode);
 }
 
-int zmk_custom_setting_array_pop_back(const struct zmk_custom_setting *const_setting,
-                                      struct zmk_custom_setting_value *value,
-                                      enum zmk_custom_setting_write_mode mode) {
+int zmk_custom_setting_array_pop_back_view(const struct zmk_custom_setting *const_setting,
+                                           struct zmk_custom_setting_value_view *value,
+                                           enum zmk_custom_setting_write_mode mode) {
     if (!const_setting || !zmk_custom_setting_is_array(const_setting)) {
         return -EINVAL;
     }
@@ -341,7 +342,11 @@ int zmk_custom_setting_array_pop_back(const struct zmk_custom_setting *const_set
 
     k_mutex_lock(&custom_settings_lock, K_FOREVER);
     if (value) {
-        copy_value(value, effective_value(tail));
+        int copy_ret = copy_value(value, effective_value(tail));
+        if (copy_ret) {
+            k_mutex_unlock(&custom_settings_lock);
+            return copy_ret;
+        }
     }
 
     set_array_memory_size_locked(setting, array_size - 1);
@@ -372,9 +377,10 @@ int zmk_custom_setting_array_pop_back(const struct zmk_custom_setting *const_set
     return ret;
 }
 
-int zmk_custom_setting_array_insert_at(const struct zmk_custom_setting *const_setting,
-                                       uint32_t index, const struct zmk_custom_setting_value *value,
-                                       enum zmk_custom_setting_write_mode mode) {
+int zmk_custom_setting_array_insert_at_view(const struct zmk_custom_setting *const_setting,
+                                            uint32_t index,
+                                            const struct zmk_custom_setting_value_view *value,
+                                            enum zmk_custom_setting_write_mode mode) {
     if (!const_setting || !value || !zmk_custom_setting_is_array(const_setting)) {
         return -EINVAL;
     }
@@ -385,7 +391,7 @@ int zmk_custom_setting_array_insert_at(const struct zmk_custom_setting *const_se
     }
 
     struct zmk_custom_setting *setting = (struct zmk_custom_setting *)const_setting;
-    int ret = zmk_custom_setting_validate(setting, value);
+    int ret = zmk_custom_setting_validate_view(setting, value);
     if (ret < 0) {
         return ret;
     }
@@ -448,9 +454,10 @@ int zmk_custom_setting_array_insert_at(const struct zmk_custom_setting *const_se
     return ret;
 }
 
-int zmk_custom_setting_array_remove_at(const struct zmk_custom_setting *const_setting,
-                                       uint32_t index, struct zmk_custom_setting_value *out_value,
-                                       enum zmk_custom_setting_write_mode mode) {
+int zmk_custom_setting_array_remove_at_view(const struct zmk_custom_setting *const_setting,
+                                            uint32_t index,
+                                            struct zmk_custom_setting_value_view *out_value,
+                                            enum zmk_custom_setting_write_mode mode) {
     if (!const_setting || !zmk_custom_setting_is_array(const_setting)) {
         return -EINVAL;
     }
@@ -475,7 +482,11 @@ int zmk_custom_setting_array_remove_at(const struct zmk_custom_setting *const_se
         struct zmk_custom_setting removed_view_storage;
         struct zmk_custom_setting *removed_view =
             array_view_init(&removed_view_storage, setting, index);
-        copy_value(out_value, effective_value(removed_view));
+        int copy_ret = copy_value(out_value, effective_value(removed_view));
+        if (copy_ret) {
+            k_mutex_unlock(&custom_settings_lock);
+            return copy_ret;
+        }
     }
     clear_temporary_past_size_locked(array_state, index);
 

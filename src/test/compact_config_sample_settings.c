@@ -5,7 +5,7 @@
 #ifndef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
 BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting) == 40,
              "Compact ARM descriptor size changed");
-BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting_state) == 16,
+BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting_state) == 1,
              "Compact state must not contain default_override");
 #endif
 #define PUBLIC ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC
@@ -51,4 +51,22 @@ static int sample_read(void) {
 #endif
 }
 SYS_INIT(sample_read, APPLICATION, 99);
+#endif
+
+BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting_value_view) == 8,
+             "Core values must not embed a maximum-size payload buffer");
+#ifndef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting_value) == 8,
+             "Compact public values use caller-owned payload storage");
+#endif
+
+BUILD_ASSERT(offsetof(struct zmk_custom_setting_value_view, size) == 2);
+BUILD_ASSERT(sizeof(void *) != 4 ||
+             offsetof(struct zmk_custom_setting_value_view, int32_value) == 4);
+
+#ifndef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting_int32_state) == 8);
+BUILD_ASSERT(sizeof(struct zmk_custom_setting_bool_state) == 2);
+BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting_behavior_state) == 16);
+BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting_blob_state) == 16);
 #endif

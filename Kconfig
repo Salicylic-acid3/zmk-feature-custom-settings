@@ -33,8 +33,10 @@ config ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
       carrier-form array defaults and hand-written fixed blob stores.
       Disable after migrating callers to stable refs and typed defaults.
       This removes their fields and translation units; it does not disable
-      arrays, persistence or Studio RPC. The common fixed-size exchange
-      value and scalar defaults/constraints are not legacy-only yet.
+      arrays, persistence or Studio RPC. The core always uses compact views;
+      OFF also replaces owning public value carriers and static metadata
+      values with compact pointer-based values. Migrate copied reads to
+      caller-owned buffers before disabling compatibility.
 
 # settings_load() runs on the main thread at boot, and this module's load
 # path (pool-backed large values, keyspace slot binding + blob decode) needs
@@ -51,10 +53,10 @@ config ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE
     int "Maximum single-frame custom setting value size"
     default 64
     range 1 64 if ZMK_CUSTOM_SETTINGS_PROTOBUF
+    range 1 65000
     help
-      Size of the struct zmk_custom_setting_value API exchange carrier
-      (stack-allocated by zmk_custom_setting_read/write callers and used by
-      compatibility adapters) and the single-frame RPC value
+      Size of the legacy owning value carrier (when compatibility is enabled)
+      and the single-frame RPC value
       bound: the largest value an incoming single-frame write can carry.
       Since simplification P4 this does NOT size any per-setting storage -
       a BYTES/STRING setting's value lives in an exact-size buffer or pool

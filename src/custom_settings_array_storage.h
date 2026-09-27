@@ -14,8 +14,8 @@ static inline void array_flag_set(uint8_t *bits, uint32_t index, bool value) {
 }
 
 void array_value_read(const struct zmk_custom_setting *array, uint32_t index,
-                      struct zmk_custom_setting_value *value);
+                      struct zmk_custom_setting_value_view *value);
 int array_value_write(const struct zmk_custom_setting *array, uint32_t index,
-                      const struct zmk_custom_setting_value *value);
+                      const struct zmk_custom_setting_value_view *value);
 void array_value_default(const struct zmk_custom_setting *array, uint32_t index);
 void array_value_swap(const struct zmk_custom_setting *array, uint32_t a, uint32_t b);

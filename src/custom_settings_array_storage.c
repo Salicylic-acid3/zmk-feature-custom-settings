@@ -15,33 +15,32 @@ static void *element(const struct zmk_custom_setting *array, uint32_t index) {
 }
 
 void array_value_read(const struct zmk_custom_setting *array, uint32_t index,
-                      struct zmk_custom_setting_value *value) {
-    *value = (struct zmk_custom_setting_value){.type = array->value_type};
+                      struct zmk_custom_setting_value_view *value) {
+    *value = (struct zmk_custom_setting_value_view){.type = array->value_type};
     const void *data = element(array, index);
     if (ZMK_CUSTOM_SETTING_TYPE_IS_BLOB(array->value_type)) {
         const struct zmk_custom_setting_blob *blob = data;
         value->size = blob->size;
-        if (blob->size) {
-            memcpy(value->bytes_value, blob->data, blob->size);
-        }
-        /* The carrier has one extra byte for STRING termination. */
-        value->string_value[blob->size] = '\0';
+        value->bytes_value = blob->data;
+    } else if (array->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_BEHAVIOR) {
+        value->behavior_value = data;
     } else {
         memcpy(&value->int32_value, data, stride(array));
     }
 }
 
 int array_value_write(const struct zmk_custom_setting *array, uint32_t index,
-                      const struct zmk_custom_setting_value *value) {
+                      const struct zmk_custom_setting_value_view *value) {
     void *dest = element(array, index);
     if (ZMK_CUSTOM_SETTING_TYPE_IS_BLOB(array->value_type)) {
-        size_t size = array->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING
-                          ? bounded_strlen(value->string_value, sizeof(value->string_value))
-                          : value->size;
+        size_t size = value->size;
         return blob_write_locked(&zmk_custom_settings_shared_pool, dest, value->bytes_value, size,
                                  array->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING);
     }
-    memcpy(dest, &value->int32_value, stride(array));
+    const void *data = array->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_BEHAVIOR
+                           ? (const void *)value->behavior_value
+                           : (const void *)&value->int32_value;
+    memcpy(dest, data, stride(array));
     return 0;
 }
 

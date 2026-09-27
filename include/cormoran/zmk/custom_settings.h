@@ -74,17 +74,7 @@ enum zmk_custom_setting_changed_kind {
     ZMK_CUSTOM_SETTING_CHANGED_RESET,
 };
 
-struct zmk_custom_setting_value {
-    enum zmk_custom_setting_value_type type;
-    size_t size;
-    union {
-        uint8_t bytes_value[CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE];
-        int32_t int32_value;
-        bool bool_value;
-        char string_value[CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE + 1];
-        struct zmk_custom_setting_behavior_value behavior_value;
-    };
-};
+#include <cormoran/zmk/custom_settings/value_types.h>
 
 struct zmk_custom_setting;
 
@@ -165,21 +155,7 @@ struct zmk_custom_setting_array_state {
 #endif
 };
 
-/* Compatibility descriptor state. Array views share their parent's state;
- * keyspace slots own one state each. All accesses require the settings lock. */
-struct zmk_custom_setting_state {
-    uint8_t flags;
-    union {
-        int32_t int32_value;
-        bool bool_value;
-        struct zmk_custom_setting_behavior_value behavior;
-        struct zmk_custom_setting_blob blob;
-    };
-    /* Caller-owned override must outlive all uses of this setting. */
-#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
-    const struct zmk_custom_setting_value *default_override;
-#endif
-};
+#include <cormoran/zmk/custom_settings/state.h>
 
 /* struct zmk_custom_setting_state.flags bits. */
 #define ZMK_CUSTOM_SETTING_STATE_INITIALIZED BIT(0)
@@ -223,34 +199,6 @@ struct zmk_custom_settings_initialized {
 };
 
 ZMK_EVENT_DECLARE(zmk_custom_settings_initialized);
-
-#define ZMK_CUSTOM_SETTING_VALUE_INT32(_value)                                                     \
-    ((struct zmk_custom_setting_value){.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,                \
-                                       .int32_value = (_value)})
-
-#define ZMK_CUSTOM_SETTING_VALUE_BOOL(_value)                                                      \
-    ((struct zmk_custom_setting_value){.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL,                 \
-                                       .bool_value = (_value)})
-
-#define ZMK_CUSTOM_SETTING_VALUE_STRING(_value)                                                    \
-    ((struct zmk_custom_setting_value){.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING,               \
-                                       .size = sizeof(_value) - 1,                                 \
-                                       .string_value = (_value)})
-
-#define ZMK_CUSTOM_SETTING_VALUE_BYTES(...)                                                        \
-    ((struct zmk_custom_setting_value){                                                            \
-        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES,                                               \
-        .size = sizeof((uint8_t[]){__VA_ARGS__}),                                                  \
-        .bytes_value = {__VA_ARGS__},                                                              \
-    })
-
-#define ZMK_CUSTOM_SETTING_VALUE_BEHAVIOR(_behavior_id, _param1, _param2)                          \
-    ((struct zmk_custom_setting_value){                                                            \
-        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BEHAVIOR,                                            \
-        .behavior_value = {.behavior_id = (_behavior_id),                                          \
-                           .param1 = (_param1),                                                    \
-                           .param2 = (_param2)},                                                   \
-    })
 
 #define ZMK_CUSTOM_SETTINGS_STRINGIFY(x) ZMK_CUSTOM_SETTINGS_STRINGIFY_INNER(x)
 #define ZMK_CUSTOM_SETTINGS_STRINGIFY_INNER(x) #x
@@ -360,7 +308,7 @@ ZMK_EVENT_DECLARE(zmk_custom_settings_initialized);
     static const struct zmk_custom_setting_constraint _name##_constraints[] = {__VA_ARGS__};       \
     ZMK_CUSTOM_SETTING_METADATA_DEFINE(_name, _rpc_serializer, _rpc_deserializer);                 \
     static const struct zmk_custom_setting_value _name##_default = _default_value;                 \
-    static struct zmk_custom_setting_state _name##_state = {0};                                    \
+    ZMK_CUSTOM_SETTING_STATE_DEFINE(_name##_state, _value_type);                                   \
     const STRUCT_SECTION_ITERABLE(zmk_custom_setting, _name) = {                                   \
         .custom_subsystem_id = _custom_subsystem_id,                                               \
         .key = _key,                                                                               \
@@ -378,7 +326,7 @@ ZMK_EVENT_DECLARE(zmk_custom_settings_initialized);
                  .pool = ZMK_CUSTOM_SETTING_TYPE_IS_BLOB(_value_type)                              \
                              ? &zmk_custom_settings_shared_pool                                    \
                              : NULL},                                                              \
-        .state = &_name##_state,                                                                   \
+        .state = ZMK_CUSTOM_SETTING_STATE_HEADER(_name##_state),                                   \
     }
 
 /*
@@ -461,9 +409,7 @@ ZMK_EVENT_DECLARE(zmk_custom_settings_initialized);
     static const struct zmk_custom_setting_constraint _name##_constraints[] = {__VA_ARGS__};       \
     ZMK_CUSTOM_SETTING_METADATA_DEFINE(_name, _rpc_serializer, _rpc_deserializer);                 \
     static const struct zmk_custom_setting_value _name##_default = _default_value;                 \
-    static struct zmk_custom_setting_state _name##_state = {                                       \
-        .flags = 0,                                                                                \
-    };                                                                                             \
+    ZMK_CUSTOM_SETTING_STATE_DEFINE(_name##_state, _value_type);                                   \
     const STRUCT_SECTION_ITERABLE(zmk_custom_setting, _name) = {                                   \
         .custom_subsystem_id = _custom_subsystem_id,                                               \
         .key = _key,                                                                               \
@@ -476,7 +422,7 @@ ZMK_EVENT_DECLARE(zmk_custom_settings_initialized);
             .constraints_count = ARRAY_SIZE(_name##_constraints),                                  \
         .default_value = &_name##_default,                                                         \
         .blob = {.max_size = (_max_size), .pool = &(_pool)},                                       \
-        .state = &_name##_state,                                                                   \
+        .state = ZMK_CUSTOM_SETTING_STATE_HEADER(_name##_state),                                   \
     }
 
 /*
@@ -954,7 +900,11 @@ struct zmk_custom_setting_keyspace_slot {
     /* A slot descriptor is a runtime-built RAM instance of the (normally
      * const/flash) struct zmk_custom_setting, so it embeds its own state
      * block right here; keyspace_bind_slot_locked points setting.state at it. */
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
     struct zmk_custom_setting_state state;
+#else
+    struct zmk_custom_setting_blob_state state;
+#endif
     struct zmk_custom_setting setting;
 };
 
@@ -1215,3 +1165,5 @@ zmk_custom_setting_keyspace_of(const struct zmk_custom_setting *setting) {
 #ifndef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
 #define ZMK_CUSTOM_SETTING_LEGACY_DEFAULTS_INIT(defaults_)
 #endif
+
+#include <cormoran/zmk/custom_settings/value_view.h>

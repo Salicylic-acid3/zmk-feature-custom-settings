@@ -54,6 +54,7 @@ PASS: custom_settings_ref_rejects_reused_slot
 PASS: custom_settings_typed_string_array
 PASS: custom_settings_pool_alias_input
 PASS: custom_settings_persist_failure_preserves_ram
+PASS: custom_settings_compact_value_views
 PASS: split_peripheral_relay
 PASS: split_peripheral_relay_pop_back size=2
 PASS: split_peripheral_relay_push_back array[2]=44 size=3

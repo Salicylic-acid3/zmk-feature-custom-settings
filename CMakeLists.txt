@@ -13,11 +13,12 @@ if(CONFIG_ZMK_CUSTOM_SETTINGS)
     zephyr_linker_sources(ROM_SECTIONS include/linker/zmk-custom-settings-rom.ld)
     zephyr_linker_sources(DATA_SECTIONS include/linker/zmk-custom-settings.ld)
 
-    target_sources(app PRIVATE src/custom_settings.c)
+    target_sources(app PRIVATE src/custom_settings.c src/custom_settings_value.c)
     target_sources(app PRIVATE src/custom_settings_allocator.c
                                src/custom_settings_blob.c src/custom_settings_ref.c)
     if(CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT)
-        target_sources(app PRIVATE src/compat/default_override.c src/compat/fixed_store.c)
+        target_sources(app PRIVATE src/compat/default_override.c src/compat/fixed_store.c
+                                   src/compat/value.c src/compat/value_api.c)
         if(CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY)
             target_sources(app PRIVATE src/compat/array_views.c src/compat/array_defaults.c)
         endif()

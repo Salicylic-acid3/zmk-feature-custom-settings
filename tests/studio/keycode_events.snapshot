@@ -60,6 +60,7 @@ PASS: custom_settings_ref_rejects_reused_slot
 PASS: custom_settings_typed_string_array
 PASS: custom_settings_pool_alias_input
 PASS: custom_settings_persist_failure_preserves_ram
+PASS: custom_settings_compact_value_views
 PASS: custom_settings_behavior_value param1=0x70004
 PASS: custom_settings_behavior_value_rejects_invalid
 PASS: custom_settings_reset_keyspace_deletes_entry key=macro/reset

@@ -39,7 +39,8 @@ int blob_write_locked(struct zmk_custom_setting_large_pool *pool,
 
 void pool_release_locked(const struct zmk_custom_setting *setting) {
     if (setting->blob.pool) {
-        custom_settings_pool_release(setting->blob.pool, &setting->state->blob);
+        custom_settings_pool_release(setting->blob.pool,
+                                     zmk_custom_setting_state_blob(setting->state));
     }
 }
 
@@ -66,7 +67,7 @@ int zmk_custom_setting_with_large_raw_bytes(const struct zmk_custom_setting *set
         return -ENOTSUP;
     }
 
-    const struct zmk_custom_setting_state *state = setting->state;
+    struct zmk_custom_setting_state *state = setting->state;
 
     if (setting->_keyspace) {
         /* Stream only the payload slice - skip the embedded
@@ -74,16 +75,21 @@ int zmk_custom_setting_with_large_raw_bytes(const struct zmk_custom_setting *set
          * header). Re-derived under the lock every call, same invariant as
          * every other blob.data access in this file. */
         size_t key_len = keyspace_blob_key_len_locked(setting);
-        const uint8_t *payload =
-            state->blob.size > key_len ? state->blob.data + key_len + 1 : (const uint8_t *)"";
-        size_t payload_size = state->blob.size > key_len ? state->blob.size - key_len - 1 : 0;
+        const uint8_t *payload = zmk_custom_setting_state_blob(state)->size > key_len
+                                     ? zmk_custom_setting_state_blob(state)->data + key_len + 1
+                                     : (const uint8_t *)"";
+        size_t payload_size = zmk_custom_setting_state_blob(state)->size > key_len
+                                  ? zmk_custom_setting_state_blob(state)->size - key_len - 1
+                                  : 0;
         visitor(payload, payload_size, user_data);
         k_mutex_unlock(&custom_settings_lock);
         return 0;
     }
 
-    const uint8_t *data = state->blob.size > 0 ? state->blob.data : (const uint8_t *)"";
-    visitor(data, state->blob.size, user_data);
+    const uint8_t *data = zmk_custom_setting_state_blob(state)->size > 0
+                              ? zmk_custom_setting_state_blob(state)->data
+                              : (const uint8_t *)"";
+    visitor(data, zmk_custom_setting_state_blob(state)->size, user_data);
     k_mutex_unlock(&custom_settings_lock);
     return 0;
 }

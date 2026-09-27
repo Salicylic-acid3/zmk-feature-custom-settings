@@ -176,7 +176,8 @@ static void record_read_raw(const uint8_t *data, size_t size, void *user_data) {
         zmk_custom_setting_record_decode(context->schema, data, size, context->record);
 }
 
-static void record_read_carrier(const struct zmk_custom_setting_value *value, void *user_data) {
+static void record_read_carrier(const struct zmk_custom_setting_value_view *value,
+                                void *user_data) {
     record_read_raw(value->bytes_value, value->size, user_data);
 }
 
@@ -190,7 +191,7 @@ int zmk_custom_setting_record_get(const struct zmk_custom_setting *setting,
     struct record_read_context context = {.schema = schema, .record = record};
     int ret = zmk_custom_setting_with_large_raw_bytes(setting, record_read_raw, &context);
     if (ret == -ENOTSUP) {
-        ret = zmk_custom_setting_with_value(setting, record_read_carrier, &context);
+        ret = zmk_custom_setting_with_view(setting, record_read_carrier, &context);
     }
     return ret < 0 ? ret : context.result;
 }
