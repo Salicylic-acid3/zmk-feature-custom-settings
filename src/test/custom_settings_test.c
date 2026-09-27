@@ -19,6 +19,7 @@
 #include <zmk/event_manager.h>
 #include <cormoran/zmk/custom_settings.h>
 #include <cormoran/zmk/custom_settings/ref.h>
+#include "../custom_settings_internal.h"
 #include <zmk/keymap.h>
 #if IS_ENABLED(CONFIG_ZMK_STUDIO_RPC)
 #include <zmk/studio/custom.h>
@@ -895,14 +896,16 @@ static int test_save_default_deletes_record(void) {
 }
 
 static int test_array_lifecycle(void) {
+    struct zmk_custom_setting array_setting_storage;
     const struct zmk_custom_setting *array_setting =
-        zmk_custom_setting_find_array_element("test", "array_value", 1);
+        array_view_find(&array_setting_storage, "test", "array_value", 1);
     if (!array_setting || !zmk_custom_setting_is_array(array_setting)) {
         LOG_ERR("Test custom array setting not registered");
         return -ENOENT;
     }
+    struct zmk_custom_setting array_tail_setting_storage;
     const struct zmk_custom_setting *array_tail_setting =
-        zmk_custom_setting_find_array_element("test", "array_value", 2);
+        array_view_find(&array_tail_setting_storage, "test", "array_value", 2);
     if (!array_tail_setting || !zmk_custom_setting_is_array(array_tail_setting)) {
         LOG_ERR("Test custom array tail setting not registered");
         return -ENOENT;
@@ -1387,10 +1390,12 @@ static int test_view_based_api(void) {
 static int test_temporary_override_pool(void) {
     const struct zmk_custom_setting *int_setting = zmk_custom_setting_find("test", "int_value");
     const struct zmk_custom_setting *bytes_setting = zmk_custom_setting_find("test", "bytes_value");
+    struct zmk_custom_setting array_0_storage;
     const struct zmk_custom_setting *array_0 =
-        zmk_custom_setting_find_array_element("test", "array_value", 0);
+        array_view_find(&array_0_storage, "test", "array_value", 0);
+    struct zmk_custom_setting array_1_storage;
     const struct zmk_custom_setting *array_1 =
-        zmk_custom_setting_find_array_element("test", "array_value", 1);
+        array_view_find(&array_1_storage, "test", "array_value", 1);
     if (!int_setting || !bytes_setting || !array_0 || !array_1) {
         LOG_ERR("Temporary override pool test settings not registered");
         return -ENOENT;
@@ -1504,6 +1509,7 @@ static int test_temporary_override_pool(void) {
  * by acquiring yet another distinct element. It then asserts the full
  * temporary-override pool is available again - proving the evicted element's
  * slot was freed and not left in_use/aliased. */
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
 static int test_view_pool_temp_slot_leak(void) {
     const uint32_t pool_size = CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY_VIEW_POOL_SIZE;
     const uint32_t temp_slots = CONFIG_ZMK_CUSTOM_SETTINGS_TEMP_SLOTS;
@@ -1543,8 +1549,9 @@ static int test_view_pool_temp_slot_leak(void) {
     /* Acquire a fresh distinct element: the pool is full, so this recycles
      * slot 0, evicting the temporary-override holder. The fix must release
      * that element's temp slot here. */
+    struct zmk_custom_setting replacement_storage;
     const struct zmk_custom_setting *replacement =
-        zmk_custom_setting_find_array_element("test", "view_pool", pool_size + 1);
+        array_view_find(&replacement_storage, "test", "view_pool", pool_size + 1);
     if (!replacement) {
         return -ENOENT;
     }
@@ -1601,10 +1608,12 @@ static int test_view_pool_temp_slot_leak(void) {
     LOG_INF("PASS: custom_settings_view_pool_temp_preserved pool=%u", pool_size);
     return 0;
 }
+#endif
 
 /* Simulates what a boot-time devicetree default installer does: replace a
  * setting's compile-time default before any user value has been set, then
  * confirm reset() re-applies the new default. */
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
 static int test_boot_default_override(void) {
     const struct zmk_custom_setting *int_setting = zmk_custom_setting_find("test", "int_value");
     if (!int_setting) {
@@ -1670,6 +1679,7 @@ static int test_boot_default_override(void) {
     LOG_INF("PASS: custom_settings_boot_default_override");
     return 0;
 }
+#endif
 
 /* Build a keyspace slot's `[user_key\0][payload]` blob the way a real
  * CreateSetting+save would, for tests that seed a persisted record directly
@@ -2844,6 +2854,7 @@ static int test_initialized_event(void) {
 }
 
 /* Existing consumers may retain old ROM carriers during migration. */
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
 static const struct zmk_custom_setting_value memory_legacy_defaults[] = {
     {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING, .size = 6, .string_value = "legacy"}};
 ZMK_CUSTOM_SETTING_ARRAY_DEFINE(memory_legacy, "memory_test", "legacy",
@@ -2852,6 +2863,8 @@ ZMK_CUSTOM_SETTING_ARRAY_DEFINE(memory_legacy, "memory_test", "legacy",
                                 ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
                                 ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
                                 ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
+
+#endif
 
 static const int32_t memory_indices_defaults[32];
 ZMK_CUSTOM_SETTING_ARRAY_DEFINE(memory_indices, "memory_test", "indices",
@@ -2877,15 +2890,15 @@ static int ref_read_value(const struct zmk_custom_setting *setting, void *contex
 
 static int test_memory_redesign(void) {
     struct zmk_custom_setting_value value;
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
     if (zmk_custom_setting_read_array_by_key("memory_test", "legacy", 0, &value) < 0 ||
         strcmp(value.string_value, "legacy") != 0) {
         return -EINVAL;
     }
+#endif
     struct zmk_custom_setting_ref saved[32];
     for (uint32_t i = 0; i < ARRAY_SIZE(saved); ++i) {
-        const struct zmk_custom_setting *element =
-            zmk_custom_setting_find_array_element("memory_test", "indices", i);
-        if (!element || zmk_custom_setting_ref_capture(element, &saved[i]) < 0) {
+        if (zmk_custom_setting_ref_find("memory_test", "indices", i, &saved[i]) < 0) {
             return -EINVAL;
         }
     }
@@ -2895,6 +2908,26 @@ static int test_memory_redesign(void) {
             LOG_ERR("Saved array ref changed identity at %u", i);
             return -EINVAL;
         }
+    }
+    int32_t number = -1;
+    size_t copied;
+    enum zmk_custom_setting_value_type type;
+    if (zmk_custom_setting_ref_read_into(&saved[31], &number, sizeof(number), &copied, &type) < 0 ||
+        number != 0 || copied != sizeof(number) || type != ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32 ||
+        zmk_custom_setting_ref_read_into(&saved[31], &number, 0, &copied, &type) != -EMSGSIZE) {
+        return -EINVAL;
+    }
+    number = 42;
+    if (zmk_custom_setting_ref_write(&saved[31], &number, sizeof(number),
+                                     ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY) < 0 ||
+        zmk_custom_setting_ref_write(&saved[31], &number, 1,
+                                     ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY) != -EMSGSIZE) {
+        return -EINVAL;
+    }
+    number = 0;
+    if (zmk_custom_setting_ref_read_into(&saved[31], &number, sizeof(number), NULL, NULL) < 0 ||
+        number != 42) {
+        return -EINVAL;
     }
     LOG_INF("PASS: custom_settings_ref_32_indices");
 
@@ -3060,15 +3093,19 @@ static int custom_settings_test_init(void) {
         return ret;
     }
 
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
     ret = test_view_pool_temp_slot_leak();
     if (ret < 0) {
         return ret;
     }
+#endif
 
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
     ret = test_boot_default_override();
     if (ret < 0) {
         return ret;
     }
+#endif
 
     ret = test_keyspace_lifecycle();
     if (ret < 0) {

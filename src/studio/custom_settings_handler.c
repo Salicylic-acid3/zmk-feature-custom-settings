@@ -18,6 +18,7 @@
 #include <zephyr/sys/util.h>
 #include <cormoran/zmk/custom_settings.h>
 #include <cormoran/zmk/custom_settings/ref.h>
+#include "../custom_settings_views.h"
 #include <cormoran/zmk/custom_settings_studio.h>
 #include <cormoran/zmk/custom_settings/custom_settings.pb.h>
 #include <cormoran/zmk/custom_settings/custom_settings_relay.pb.h>
@@ -171,34 +172,34 @@ static const char *setting_ref_key(const struct zmk_custom_settings_setting_ref 
 }
 
 static const struct zmk_custom_setting *
-setting_for_ref(const struct zmk_custom_settings_setting_ref *ref) {
+setting_for_ref(const struct zmk_custom_settings_setting_ref *ref,
+                struct zmk_custom_setting *view) {
     if (!ref->has_key) {
         return NULL;
     }
 
     /* IS_ENABLED-guarded (not a plain ref->has_array_index check) so the
-     * zmk_custom_setting_find_array_element call - only defined in
+     * array_view_find call - only defined in
      * src/custom_settings_array.c when CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY is
      * enabled - is provably dead code when the feature is off, matching the
      * zmk_custom_setting_is_array() fold pattern. */
     if (IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY) && ref->has_array_index) {
-        return zmk_custom_setting_find_array_element(setting_ref_custom_subsystem_id(ref),
-                                                     setting_ref_key(ref), ref->array_index);
+        return array_view_find(view, setting_ref_custom_subsystem_id(ref), setting_ref_key(ref),
+                               ref->array_index);
     }
     return zmk_custom_setting_find(setting_ref_custom_subsystem_id(ref), setting_ref_key(ref));
 }
 
 static const struct zmk_custom_setting *
-array_for_ref(const struct zmk_custom_settings_setting_ref *ref) {
+array_for_ref(const struct zmk_custom_settings_setting_ref *ref, struct zmk_custom_setting *view) {
     if (!IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY) || !ref->has_key) {
         return NULL;
     }
 
-    return ref->has_array_index
-               ? zmk_custom_setting_find_array_element(setting_ref_custom_subsystem_id(ref),
-                                                       setting_ref_key(ref), ref->array_index)
-               : zmk_custom_setting_find_array(setting_ref_custom_subsystem_id(ref),
-                                               setting_ref_key(ref));
+    return ref->has_array_index ? array_view_find(view, setting_ref_custom_subsystem_id(ref),
+                                                  setting_ref_key(ref), ref->array_index)
+                                : zmk_custom_setting_find_array(
+                                      setting_ref_custom_subsystem_id(ref), setting_ref_key(ref));
 }
 
 static const char *
@@ -813,7 +814,7 @@ static bool encode_setting_constraints(pb_ostream_t *stream, const pb_field_t *f
     const struct zmk_custom_setting *setting = (const struct zmk_custom_setting *)*arg;
     const struct zmk_custom_setting_keyspace *keyspace = zmk_custom_setting_keyspace_of(setting);
     const struct zmk_custom_setting_constraint *constraints =
-        keyspace ? keyspace->constraints : setting->constraints;
+        keyspace ? keyspace->constraints : zmk_custom_setting_constraints(setting);
     size_t constraints_count = keyspace ? keyspace->constraints_count : setting->constraints_count;
 
     for (size_t i = 0; i < constraints_count; i++) {
@@ -849,7 +850,16 @@ static int setting_meta_to_proto(const struct zmk_custom_setting *setting,
      * resolves that relationship at encode time and emits the repeated field
      * without materialising its recursive worst-case nanopb array. */
     dest->constraints.funcs.encode = encode_setting_constraints;
-    dest->constraints.arg = (void *)setting;
+    /* Encoding may happen after the caller-local array view has returned.
+     * Constraints belong to the immutable parent, not the selected index. */
+    struct zmk_custom_setting_ref ref;
+    if (zmk_custom_setting_is_array(setting) &&
+        zmk_custom_setting_ref_capture(setting, &ref) == 0 &&
+        ref.kind == ZMK_CUSTOM_SETTING_REF_ARRAY) {
+        dest->constraints.arg = (void *)ref.owner;
+    } else {
+        dest->constraints.arg = (void *)setting;
+    }
 
     return 0;
 }
@@ -1341,8 +1351,10 @@ static bool for_each_list_item(const struct zmk_custom_settings_setting_scope *s
             setting->array_index == ZMK_CUSTOM_SETTING_ARRAY_NONE) {
             uint32_t active_size = zmk_custom_setting_array_size(setting);
             for (uint32_t i = 0; i < active_size; i++) {
-                const struct zmk_custom_setting *element = zmk_custom_setting_find_array_element(
-                    setting->custom_subsystem_id, setting->array_key, i);
+                struct zmk_custom_setting element_storage;
+                const struct zmk_custom_setting *element =
+                    array_view_find(&element_storage, setting->custom_subsystem_id,
+                                    zmk_custom_setting_public_key(setting), i);
                 if (!element || !setting_matches_scope(element, scope)) {
                     continue;
                 }
@@ -1617,7 +1629,8 @@ static int handle_private_get_setting(const struct zmk_custom_settings_setting_r
         return -ENOENT;
     }
 
-    const struct zmk_custom_setting *setting = setting_for_ref(ref);
+    struct zmk_custom_setting setting_view;
+    const struct zmk_custom_setting *setting = setting_for_ref(ref, &setting_view);
     if (!setting) {
         return -ENOENT;
     }
@@ -1683,7 +1696,8 @@ static int handle_private_write_setting(const struct zmk_custom_settings_setting
         resolved_ref.array_index = resolved_index;
     }
 
-    const struct zmk_custom_setting *setting = setting_for_ref(&resolved_ref);
+    struct zmk_custom_setting setting_view;
+    const struct zmk_custom_setting *setting = setting_for_ref(&resolved_ref, &setting_view);
     if (!setting) {
         return -ENOENT;
     }
@@ -1797,7 +1811,8 @@ static int handle_private_push_back_array(const struct zmk_custom_settings_setti
         return 0;
     }
 
-    const struct zmk_custom_setting *setting = array_for_ref(ref);
+    struct zmk_custom_setting setting_view;
+    const struct zmk_custom_setting *setting = array_for_ref(ref, &setting_view);
     if (!setting) {
         return -ENOENT;
     }
@@ -1873,7 +1888,8 @@ static int handle_private_pop_back_array(const struct zmk_custom_settings_settin
         return 0;
     }
 
-    const struct zmk_custom_setting *setting = array_for_ref(ref);
+    struct zmk_custom_setting setting_view;
+    const struct zmk_custom_setting *setting = array_for_ref(ref, &setting_view);
     if (!setting) {
         return -ENOENT;
     }
@@ -1978,7 +1994,12 @@ static int handle_private_create_setting(const struct zmk_custom_settings_settin
     if (value_uses_rpc_format) {
         struct zmk_custom_setting keyspace_value_shape = {
             .value_type = keyspace->value_type,
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
             .rpc_deserializer = keyspace->rpc_deserializer,
+#else
+            .metadata = &(const struct zmk_custom_setting_metadata){.rpc_deserializer =
+                                                                        keyspace->rpc_deserializer},
+#endif
         };
         ret =
             zmk_custom_setting_deserialize_rpc_value(&keyspace_value_shape, value, &internal_value);
@@ -2182,7 +2203,8 @@ handle_private_write_value_chunk(const struct zmk_custom_settings_setting_ref *r
         return 0;
     }
 
-    const struct zmk_custom_setting *setting = setting_for_ref(ref);
+    struct zmk_custom_setting setting_view;
+    const struct zmk_custom_setting *setting = setting_for_ref(ref, &setting_view);
     if (!setting) {
         return -ENOENT;
     }
@@ -2396,7 +2418,8 @@ static bool relay_request_unlock_required(const cormoran_zmk_custom_settings_Req
             ref.array_index = array_index;
         }
 
-        const struct zmk_custom_setting *setting = setting_for_ref(&ref);
+        struct zmk_custom_setting setting_view;
+        const struct zmk_custom_setting *setting = setting_for_ref(&ref, &setting_view);
         return setting && setting->write_permission == ZMK_CUSTOM_SETTING_PERMISSION_SECURE;
     }
     case cormoran_zmk_custom_settings_Request_push_back_array_tag: {
@@ -2405,7 +2428,8 @@ static bool relay_request_unlock_required(const cormoran_zmk_custom_settings_Req
             return false;
         }
 
-        const struct zmk_custom_setting *setting = array_for_ref(&ref);
+        struct zmk_custom_setting setting_view;
+        const struct zmk_custom_setting *setting = array_for_ref(&ref, &setting_view);
         return setting && setting->write_permission == ZMK_CUSTOM_SETTING_PERMISSION_SECURE;
     }
     case cormoran_zmk_custom_settings_Request_pop_back_array_tag: {
@@ -2414,7 +2438,8 @@ static bool relay_request_unlock_required(const cormoran_zmk_custom_settings_Req
             return false;
         }
 
-        const struct zmk_custom_setting *setting = array_for_ref(&ref);
+        struct zmk_custom_setting setting_view;
+        const struct zmk_custom_setting *setting = array_for_ref(&ref, &setting_view);
         return setting && setting->write_permission == ZMK_CUSTOM_SETTING_PERMISSION_SECURE;
     }
     case cormoran_zmk_custom_settings_Request_save_settings_tag: {
@@ -3908,6 +3933,13 @@ static int custom_settings_notification_reencode_regression_test_init(void) {
             return -EINVAL;
         }
         src.notification_type.setting.setting.has_meta = true;
+        struct zmk_custom_setting meta_view;
+        if (use_string) {
+            meta_setting = array_view_find(&meta_view, "test", "array_value", 0);
+            if (!meta_setting) {
+                return -ENOENT;
+            }
+        }
         setting_meta_to_proto(meta_setting, &src.notification_type.setting.setting.meta);
         copy_string(src.notification_type.setting.setting.key,
                     sizeof(src.notification_type.setting.setting.key), "int32_value");
@@ -3926,12 +3958,26 @@ static int custom_settings_notification_reencode_regression_test_init(void) {
                 cormoran_zmk_custom_settings_SettingValue_int32_value_tag;
             src.notification_type.setting.setting.value.value_type.int32_value = 63;
         }
+        /* Compare the wire before/after a scoped view expires. A decoder
+         * round-trip alone would not catch metadata lost before first encode. */
+        pb_ostream_t expected = pb_ostream_from_buffer(wire2, sizeof(wire2));
+        if (!pb_encode(&expected, cormoran_zmk_custom_settings_Notification_fields, &src)) {
+            return -EIO;
+        }
+        if (use_string) {
+            memset(&meta_view, 0, sizeof(meta_view));
+        }
         pb_ostream_t out = pb_ostream_from_buffer(wire, sizeof(wire));
         if (!pb_encode(&out, cormoran_zmk_custom_settings_Notification_fields, &src)) {
             LOG_ERR("notification reencode regression: encode failed: %s", PB_GET_ERROR(&out));
             return -EIO;
         }
 
+        if (out.bytes_written != expected.bytes_written ||
+            memcmp(wire, wire2, out.bytes_written) != 0) {
+            LOG_ERR("FAIL: scoped array metadata expired before encoding");
+            return -EINVAL;
+        }
         size_t original_size = out.bytes_written;
 
         /* 2. Decode it the way relayed_notification_to_public does. */
@@ -4396,8 +4442,9 @@ static int custom_settings_split_peripheral_relay_test_init(void) {
     }
     const struct zmk_custom_setting *array_setting =
         zmk_custom_setting_find_array("test", "array_value");
+    struct zmk_custom_setting array_tail_storage;
     const struct zmk_custom_setting *array_tail =
-        zmk_custom_setting_find_array_element("test", "array_value", 2);
+        array_view_find(&array_tail_storage, "test", "array_value", 2);
     if (!array_setting || !array_tail) {
         LOG_ERR("Split peripheral relay array setting not registered");
         return -ENOENT;

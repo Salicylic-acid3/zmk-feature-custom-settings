@@ -25,6 +25,17 @@ config ZMK_CUSTOM_SETTINGS
 
 if ZMK_CUSTOM_SETTINGS
 
+config ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+    bool "Keep legacy descriptor adapters"
+    default y
+    help
+      Enable borrowed array-view pointers, runtime default overrides,
+      carrier-form array defaults and hand-written fixed blob stores.
+      Disable after migrating callers to stable refs and typed defaults.
+      This removes their fields and translation units; it does not disable
+      arrays, persistence or Studio RPC. The common fixed-size exchange
+      value and scalar defaults/constraints are not legacy-only yet.
+
 # settings_load() runs on the main thread at boot, and this module's load
 # path (pool-backed large values, keyspace slot binding + blob decode) needs
 # more headroom than Zephyr's bare 1024-byte MAIN_STACK_SIZE default.
@@ -228,6 +239,7 @@ config ZMK_CUSTOM_SETTINGS_ARRAY
       Disable to shrink firmware when no setting is an array.
 
 config ZMK_CUSTOM_SETTINGS_ARRAY_VIEW_POOL_SIZE
+    depends on ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
     int "Array element index view pool size"
     default 16
     range 1 64
@@ -277,5 +289,13 @@ config ZMK_CUSTOM_SETTINGS_TEST
 
 config ZMK_CUSTOM_SETTINGS_ZMK_CONFIG_SAMPLES
     bool "Enable custom settings samples for tests/zmk-config"
+
+config ZMK_CUSTOM_SETTINGS_ZMK_CONFIG_TYPED_SAMPLES
+    bool "Use typed registration samples"
+    depends on ZMK_CUSTOM_SETTINGS_ZMK_CONFIG_SAMPLES
+    default y if !ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+    help
+      Build identical sample settings with either descriptor layout, for
+      comparing compatibility costs. This only affects the test fixtures.
 
 endif

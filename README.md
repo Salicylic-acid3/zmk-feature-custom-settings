@@ -1041,3 +1041,61 @@ Run `python3 -m unittest -v` in the workspace devShell for the host allocator,
 native_sim snapshots and six firmware builds. Outputs are worktree-local under
 `build/`. `python3 -m unittest test_pool -v` runs the allocator's deterministic
 20,000-operation invariant test with UndefinedBehaviorSanitizer without Zephyr.
+
+### Optional legacy adapters
+
+`CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT=y` is the default for existing modules.
+Set it to `n` after migrating consumers:
+
+```conf
+CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT=n
+```
+
+This removes the old array-view cache and `find_array_element()`, runtime
+`set_default()` overrides, carrier-form array defaults and support for
+hand-written fixed blob stores. Their implementations are isolated in
+`src/compat/`; their public API/layout is in
+`include/cormoran/zmk/custom_settings/compat/`. The build excludes these files
+entirely when compatibility is off. A legacy array-default registration fails
+at compile time instead of being silently reinterpreted.
+
+On ARM32, the descriptor shrinks from 52 to 40 bytes, the state from 20 to 16,
+and array state from 36 to 32. Constraints and RPC converter pointers move to
+immutable metadata; core code uses accessors rather than compatibility fields.
+Core array, keyspace, persistence and Studio RPC functionality remains enabled.
+The fixed-size `zmk_custom_setting_value` **still belongs to the common exchange /
+validation code**, including scalar defaults and constraints. This switch does
+not yet eliminate that 76-byte carrier or the shared scratch values.
+
+Use typed array defaults and the standard pooled registration macros instead of
+hand-written descriptors. Use `zmk_custom_setting_constraints()` and the RPC
+converter accessors when reading descriptor metadata. Replace boot-time default
+overrides with immutable defaults (or explicitly initialize a memory value,
+understanding that reset then restores the immutable default).
+
+Resolve retained array identities directly, without a borrowed descriptor:
+
+```c
+#include <cormoran/zmk/custom_settings/ref.h>
+
+struct zmk_custom_setting_ref ref;
+int err = zmk_custom_setting_ref_find("my_module", "levels", 2, &ref);
+if (!err) {
+    int32_t next = 7;
+    err = zmk_custom_setting_ref_write(&ref, &next, sizeof(next),
+                                      ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY);
+}
+```
+
+`ref_read_into()` copies into caller-owned storage; `ref_write()` borrows input
+only for the call. Scalars use native C representation, STRING length excludes
+the terminating NUL. For a scalar/keyspace key or array parent, pass
+`ZMK_CUSTOM_SETTING_ARRAY_NONE` as the lookup index. Use `ref_visit()` for other
+synchronous operations. Scoped descriptors in callbacks/events must not be kept;
+capture a ref when retaining identity. Flash record and protobuf wire formats
+are unchanged by the compatibility switch.
+
+DYA2's current consumers still use legacy defaults/APIs, so its validation build
+keeps compatibility enabled. Disabling it requires migrating those modules too.
+The test matrix exercises both layouts in native core/Studio/split-peripheral
+suites and provides identical ARM sample settings with compatibility on/off.

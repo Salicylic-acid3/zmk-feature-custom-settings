@@ -4,21 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-/*
- * Array settings (CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY).
- *
- * A registered ZMK_CUSTOM_SETTING_ARRAY_DEFINE array has exactly one
- * compile-time struct zmk_custom_setting descriptor (array_index ==
- * ZMK_CUSTOM_SETTING_ARRAY_NONE); its elements are not individually
- * registered. Instead, zmk_custom_setting_find_array_element hands out a
- * short-lived "index view" - a struct zmk_custom_setting pulled from the
- * array_view_pool below and pointed at the array's shared array_state - so
- * callers still get an ordinary `const struct zmk_custom_setting *` for one
- * element without an O(max array length) registration cost. Every element's
- * value/dirty/has_persistent bit lives in the array's own array_state
- * buffers (see struct zmk_custom_setting_array_state in the public header),
- * not in a per-element struct zmk_custom_setting_state.
- */
+/* Array lifecycle uses caller-owned views; the core has no view cache. */
 
 #include <errno.h>
 #include <stdbool.h>
@@ -35,47 +21,21 @@
 #include "custom_settings_internal.h"
 #include "custom_settings_array_storage.h"
 
-/* Legacy pointer adapter. New retained references use owner/index/generation
- * and resolve into a caller-local view, without consuming this cache. */
-struct zmk_custom_setting_array_view_slot {
-    bool in_use;
-    struct zmk_custom_setting view;
-};
-
-static struct zmk_custom_setting_array_view_slot
-    array_view_pool[CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY_VIEW_POOL_SIZE];
-
-/* Non-static: zmk_custom_setting_discard/zmk_custom_setting_reset's array
- * branches (custom_settings.c) call this directly for whole-array discard/
- * reset. Declared in custom_settings_internal.h. */
-struct zmk_custom_setting *array_view_acquire(const struct zmk_custom_setting *array_descriptor,
-                                              uint32_t index) {
-    struct zmk_custom_setting_array_view_slot *free_slot = NULL;
-
-    for (size_t i = 0; i < ARRAY_SIZE(array_view_pool); i++) {
-        struct zmk_custom_setting_array_view_slot *slot = &array_view_pool[i];
-        if (slot->in_use && slot->view.array_state == array_descriptor->array_state &&
-            slot->view.array_index == index) {
-            return &slot->view;
-        }
-        if (!free_slot && !slot->in_use) {
-            free_slot = slot;
-        }
+/* The caller owns this view. It must not escape a synchronous operation. */
+struct zmk_custom_setting *array_view_init(struct zmk_custom_setting *view,
+                                           const struct zmk_custom_setting *array, uint32_t index) {
+    if (!zmk_custom_setting_is_array(array) || index >= array->array_state->max_size) {
+        return NULL;
     }
+    *view = *array;
+    view->array_index = index;
+    view->default_value = NULL;
+    return view;
+}
 
-    if (!free_slot) {
-        /* Only the legacy pointer adapter is recycled. Temporary overlays
-         * belong to (array, index), so eviction cannot discard a value. */
-        free_slot = &array_view_pool[0];
-    }
-
-    free_slot->in_use = true;
-    free_slot->view = *array_descriptor;
-    free_slot->view.array_index = index;
-    free_slot->view.array_state = array_descriptor->array_state;
-    free_slot->view.default_value = NULL;
-    free_slot->view.state = array_descriptor->state;
-    return &free_slot->view;
+struct zmk_custom_setting *array_view_find(struct zmk_custom_setting *view, const char *subsystem,
+                                           const char *key, uint32_t index) {
+    return array_view_init(view, zmk_custom_setting_find_array(subsystem, key), index);
 }
 
 const struct zmk_custom_setting *zmk_custom_setting_find_array(const char *custom_subsystem_id,
@@ -91,28 +51,13 @@ const struct zmk_custom_setting *zmk_custom_setting_find_array(const char *custo
             continue;
         }
 
-        if (strncmp(setting->array_key, key, CONFIG_ZMK_CUSTOM_SETTINGS_KEY_MAX_LEN) == 0) {
+        if (strncmp(zmk_custom_setting_public_key(setting), key,
+                    CONFIG_ZMK_CUSTOM_SETTINGS_KEY_MAX_LEN) == 0) {
             return setting;
         }
     }
 
     return NULL;
-}
-
-const struct zmk_custom_setting *
-zmk_custom_setting_find_array_element(const char *custom_subsystem_id, const char *key,
-                                      uint32_t index) {
-    const struct zmk_custom_setting *array_setting =
-        zmk_custom_setting_find_array(custom_subsystem_id, key);
-    if (!array_setting || index >= array_setting->array_state->max_size) {
-        return NULL;
-    }
-
-    k_mutex_lock(&custom_settings_lock, K_FOREVER);
-    struct zmk_custom_setting *view = array_view_acquire(array_setting, index);
-    k_mutex_unlock(&custom_settings_lock);
-
-    return view;
 }
 
 static int validate_array_size(const struct zmk_custom_setting *setting, uint32_t array_size) {
@@ -172,7 +117,7 @@ int array_size_storage_name(const struct zmk_custom_setting *setting, char *name
     }
 
     int ret = snprintf(name, name_size, SETTINGS_SUBTREE "/%s/%s/%s", setting->custom_subsystem_id,
-                       setting->array_key, ARRAY_SIZE_STORAGE_KEY);
+                       zmk_custom_setting_public_key(setting), ARRAY_SIZE_STORAGE_KEY);
     if (ret < 0 || ret >= name_size) {
         return -ENAMETOOLONG;
     }
@@ -192,8 +137,9 @@ static int delete_inactive_array_values_locked(const struct zmk_custom_setting *
             continue;
         }
 
+        struct zmk_custom_setting view_storage;
         struct zmk_custom_setting *view =
-            array_view_acquire((struct zmk_custom_setting *)array_descriptor, index);
+            array_view_init(&view_storage, (struct zmk_custom_setting *)array_descriptor, index);
         char name[SETTINGS_MAX_NAME_LEN];
         int ret = setting_storage_name(view, name, sizeof(name));
         if (ret < 0) {
@@ -233,8 +179,9 @@ int save_array_locked(const struct zmk_custom_setting *array_descriptor) {
     }
 
     for (uint32_t index = 0; index < array_size; index++) {
+        struct zmk_custom_setting view_storage;
         struct zmk_custom_setting *view =
-            array_view_acquire((struct zmk_custom_setting *)array_descriptor, index);
+            array_view_init(&view_storage, (struct zmk_custom_setting *)array_descriptor, index);
         char name[SETTINGS_MAX_NAME_LEN];
         ret = setting_storage_name(view, name, sizeof(name));
         if (ret < 0) {
@@ -265,8 +212,9 @@ int save_array_locked(const struct zmk_custom_setting *array_descriptor) {
 
 int zmk_custom_setting_read_array_by_key(const char *custom_subsystem_id, const char *key,
                                          uint32_t index, struct zmk_custom_setting_value *value) {
+    struct zmk_custom_setting setting_storage;
     const struct zmk_custom_setting *setting =
-        zmk_custom_setting_find_array_element(custom_subsystem_id, key, index);
+        array_view_find(&setting_storage, custom_subsystem_id, key, index);
     if (!setting) {
         return -ENOENT;
     }
@@ -278,8 +226,9 @@ int zmk_custom_setting_write_array_by_key(const char *custom_subsystem_id, const
                                           uint32_t index,
                                           const struct zmk_custom_setting_value *value,
                                           enum zmk_custom_setting_write_mode mode) {
+    struct zmk_custom_setting setting_storage;
     const struct zmk_custom_setting *setting =
-        zmk_custom_setting_find_array_element(custom_subsystem_id, key, index);
+        array_view_find(&setting_storage, custom_subsystem_id, key, index);
     if (!setting) {
         return -ENOENT;
     }
@@ -352,8 +301,10 @@ int zmk_custom_setting_array_push_back(const struct zmk_custom_setting *setting,
         return -ERANGE;
     }
 
-    const struct zmk_custom_setting *tail = zmk_custom_setting_find_array_element(
-        setting->custom_subsystem_id, setting->array_key, array_size);
+    struct zmk_custom_setting tail_storage;
+    const struct zmk_custom_setting *tail =
+        array_view_find(&tail_storage, setting->custom_subsystem_id,
+                        zmk_custom_setting_public_key(setting), array_size);
     if (!tail) {
         return -ENOENT;
     }
@@ -378,8 +329,10 @@ int zmk_custom_setting_array_pop_back(const struct zmk_custom_setting *const_set
     }
     k_mutex_unlock(&custom_settings_lock);
 
-    const struct zmk_custom_setting *tail_const = zmk_custom_setting_find_array_element(
-        setting->custom_subsystem_id, setting->array_key, array_size - 1);
+    struct zmk_custom_setting tail_const_storage;
+    const struct zmk_custom_setting *tail_const =
+        array_view_find(&tail_const_storage, setting->custom_subsystem_id,
+                        zmk_custom_setting_public_key(setting), array_size - 1);
     if (!tail_const) {
         return -ENOENT;
     }
@@ -466,7 +419,8 @@ int zmk_custom_setting_array_insert_at(const struct zmk_custom_setting *const_se
     clear_temporary_past_size_locked(array_state, index);
     array_state->size = array_size + 1;
 
-    struct zmk_custom_setting *view = array_view_acquire(setting, index);
+    struct zmk_custom_setting view_storage;
+    struct zmk_custom_setting *view = array_view_init(&view_storage, setting, index);
     ret = 0;
     switch (mode) {
     case ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY:
@@ -518,7 +472,9 @@ int zmk_custom_setting_array_remove_at(const struct zmk_custom_setting *const_se
     }
 
     if (out_value) {
-        struct zmk_custom_setting *removed_view = array_view_acquire(setting, index);
+        struct zmk_custom_setting removed_view_storage;
+        struct zmk_custom_setting *removed_view =
+            array_view_init(&removed_view_storage, setting, index);
         copy_value(out_value, effective_value(removed_view));
     }
     clear_temporary_past_size_locked(array_state, index);
@@ -531,7 +487,9 @@ int zmk_custom_setting_array_remove_at(const struct zmk_custom_setting *const_se
     array_state->size = array_size - 1;
     array_flag_set(array_state->dirty, array_size - 1, true);
 
-    struct zmk_custom_setting *tail_view = array_view_acquire(setting, array_size - 1);
+    struct zmk_custom_setting tail_view_storage;
+    struct zmk_custom_setting *tail_view =
+        array_view_init(&tail_view_storage, setting, array_size - 1);
     int ret = 0;
     switch (mode) {
     case ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY:

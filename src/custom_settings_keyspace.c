@@ -150,8 +150,7 @@ struct zmk_custom_setting *keyspace_bind_slot_locked(struct zmk_custom_setting_k
     slot->setting = (struct zmk_custom_setting){
         .custom_subsystem_id = keyspace->custom_subsystem_id,
         .key = keyspace->key_prefix,
-        .array_key = NULL,
-        .array_index = ZMK_CUSTOM_SETTING_ARRAY_NONE,
+        ZMK_CUSTOM_SETTING_ARRAY_KEY_INIT(NULL).array_index = ZMK_CUSTOM_SETTING_ARRAY_NONE,
         .value_type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES,
         .confidentiality = keyspace->confidentiality,
         .read_permission = keyspace->read_permission,
@@ -159,11 +158,10 @@ struct zmk_custom_setting *keyspace_bind_slot_locked(struct zmk_custom_setting_k
         /* Deliberately NOT keyspace->constraints/rpc_*: those describe the
          * PAYLOAD, not the slot's own opaque BYTES blob, which has no
          * constraints of its own. */
-        .constraints = NULL,
+
         .constraints_count = 0,
         .default_value = NULL,
-        .rpc_serializer = NULL,
-        .rpc_deserializer = NULL,
+
         .blob = {.max_size = keyspace->max_key_len + keyspace->max_size,
                  .pool = keyspace->large_pool},
         ._keyspace = keyspace,
@@ -200,10 +198,17 @@ void keyspace_release_slot_for_setting_locked(struct zmk_custom_setting_keyspace
  * zmk_custom_setting_write's keyspace branch. */
 int keyspace_validate_payload(const struct zmk_custom_setting_keyspace *keyspace,
                               const struct zmk_custom_setting_value *value) {
+#ifndef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+    const struct zmk_custom_setting_metadata metadata = {.constraints = keyspace->constraints};
+#endif
     struct zmk_custom_setting payload_shape = {
         .value_type = keyspace->value_type,
         .blob.max_size = keyspace->max_size,
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
         .constraints = keyspace->constraints,
+#else
+        .metadata = &metadata,
+#endif
         .constraints_count = keyspace->constraints_count,
     };
     int ret = zmk_custom_setting_validate(&payload_shape, value);

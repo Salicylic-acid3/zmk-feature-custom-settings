@@ -47,34 +47,22 @@ int array_value_write(const struct zmk_custom_setting *array, uint32_t index,
 
 void array_value_default(const struct zmk_custom_setting *array, uint32_t index) {
     void *dest = element(array, index);
-    const struct zmk_custom_setting_value *legacy =
-        array->array_state->defaults_are_carriers
-            ? &((const struct zmk_custom_setting_value *)array->array_state->defaults)[index]
-            : NULL;
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+    if (compat_array_default(array, index)) {
+        return;
+    }
+#endif
     if (ZMK_CUSTOM_SETTING_TYPE_IS_BLOB(array->value_type)) {
-        struct zmk_custom_setting_slice slice;
-        size_t default_size;
-        if (legacy) {
-            slice.data = legacy->bytes_value;
-            default_size = array->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING
-                               ? bounded_strlen(legacy->string_value, sizeof(legacy->string_value))
-                               : legacy->size;
-        } else {
-            slice = ((const struct zmk_custom_setting_slice *)array->array_state->defaults)[index];
-            default_size = slice.size;
-        }
+        struct zmk_custom_setting_slice slice =
+            ((const struct zmk_custom_setting_slice *)array->array_state->defaults)[index];
         struct zmk_custom_setting_blob *blob = dest;
         custom_settings_pool_release(&zmk_custom_settings_shared_pool, blob);
-        if (default_size > CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE ||
-            (default_size && !slice.data) || (legacy && legacy->type != array->value_type)) {
+        if (slice.size > CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE || (slice.size && !slice.data)) {
             LOG_ERR("Invalid array default: %s[%u]", array->key, index);
             return;
         }
         blob->data = (uint8_t *)slice.data;
-        blob->size = default_size;
-    } else if (legacy) {
-        /* Only the adapter reads old carriers. Live storage stays typed. */
-        memcpy(dest, &legacy->int32_value, stride(array));
+        blob->size = slice.size;
     } else {
         memcpy(dest, (const uint8_t *)array->array_state->defaults + index * stride(array),
                stride(array));

@@ -123,15 +123,11 @@ int blob_store_set_raw(const struct zmk_custom_setting *setting, const void *dat
                                  setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING);
     }
 
-    if (size > 0) {
-        memmove(setting->state->blob.data, data, size);
-    }
-    if (setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING &&
-        setting->state->blob.data != NULL) {
-        setting->state->blob.data[size] = '\0';
-    }
-    setting->state->blob.size = size;
-    return 0;
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+    return compat_blob_store_set_raw(setting, data, size);
+#else
+    return -EINVAL;
+#endif
 }
 
 /* Copy a carrier value (BYTES/STRING, <= carrier size) into a blob setting's
@@ -151,13 +147,15 @@ static int blob_store_set_value(const struct zmk_custom_setting *setting,
     }
 }
 
-/* The default a setting currently falls back to: the runtime override
- * installed by zmk_custom_setting_set_default() if any, else the
- * registration-time (flash) default. */
+/* Defaults are immutable unless the legacy boot-time override API is enabled. */
 static const struct zmk_custom_setting_value *
 setting_default_value(const struct zmk_custom_setting *setting) {
-    return setting->state->default_override ? setting->state->default_override
-                                            : setting->default_value;
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+    if (setting->state->default_override) {
+        return setting->state->default_override;
+    }
+#endif
+    return setting->default_value;
 }
 
 /* Store a validated carrier value as a non-array setting's in-memory value:
@@ -188,7 +186,7 @@ static int store_scalar_value_locked(const struct zmk_custom_setting *setting,
 
 /* Reverting a pooled blob borrows its default without consuming live bytes.
  * Runtime defaults follow the same caller-owned lifetime as ROM defaults. */
-static void apply_scalar_default_locked(const struct zmk_custom_setting *setting) {
+void apply_scalar_default_locked(const struct zmk_custom_setting *setting) {
     if (zmk_custom_setting_keyspace_of(setting)) {
         /* A keyspace slot has no compile-time default payload: its blob
          * always carries a user key that only exists once the entry is
@@ -566,7 +564,12 @@ const char *zmk_custom_setting_public_key(const struct zmk_custom_setting *setti
         return key;
     }
 
-    return zmk_custom_setting_is_array(setting) ? setting->array_key : setting->key;
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+    if (zmk_custom_setting_is_array(setting)) {
+        return setting->array_key;
+    }
+#endif
+    return setting->key;
 }
 
 /* Validate a BEHAVIOR value's behaviorId/param1/param2 against the target
@@ -730,7 +733,8 @@ int zmk_custom_setting_validate(const struct zmk_custom_setting *setting,
     }
 
     for (size_t c = 0; c < setting->constraints_count; c++) {
-        const struct zmk_custom_setting_constraint *constraint = &setting->constraints[c];
+        const struct zmk_custom_setting_constraint *constraint =
+            &zmk_custom_setting_constraints(setting)[c];
 
         switch (constraint->type) {
         case ZMK_CUSTOM_SETTING_CONSTRAINT_NONE:
@@ -780,45 +784,6 @@ int zmk_custom_setting_validate(const struct zmk_custom_setting *setting,
     return 0;
 }
 
-int zmk_custom_setting_set_default(const struct zmk_custom_setting *setting,
-                                   const struct zmk_custom_setting_value *value) {
-    if (!setting || !value) {
-        return -EINVAL;
-    }
-
-    /* Array elements have per-index defaults from array_state->defaults,
-     * set once at registration time (ZMK_CUSTOM_SETTING_ARRAY_DEFINE); there
-     * is no runtime-replaceable default for an array element/view. */
-    if (zmk_custom_setting_is_array(setting)) {
-        return -ENOTSUP;
-    }
-
-    int ret = zmk_custom_setting_validate(setting, value);
-    if (ret < 0) {
-        return ret;
-    }
-
-    k_mutex_lock(&custom_settings_lock, K_FOREVER);
-    /* The descriptor (and its default_value pointer) is const/flash-resident,
-     * so the replacement default lives on the RAM state block instead and
-     * setting_default_value() consults it first everywhere a default is read
-     * (init, discard, reset). */
-    setting->state->default_override = value;
-    /* No persisted value has been loaded and no in-memory write has happened
-     * yet, so the current memory value (whatever it was materialized to, or
-     * even its zero-initialized pre-init state) still represents "unset" -
-     * refresh it too. This makes the call safe regardless of whether it runs
-     * before or after this module's own registry init, as long as it is
-     * before settings_load() (i.e. from any SYS_INIT). */
-    if (!setting_has_persistent_value(setting) &&
-        !state_flag(setting, ZMK_CUSTOM_SETTING_STATE_DIRTY)) {
-        apply_scalar_default_locked(setting);
-    }
-    k_mutex_unlock(&custom_settings_lock);
-
-    return 0;
-}
-
 int setting_storage_name(const struct zmk_custom_setting *setting, char *name, size_t name_size) {
     int ret;
 
@@ -841,7 +806,7 @@ int setting_storage_name(const struct zmk_custom_setting *setting, char *name, s
     if (zmk_custom_setting_is_array(setting) &&
         setting->array_index != ZMK_CUSTOM_SETTING_ARRAY_NONE) {
         ret = snprintf(name, name_size, SETTINGS_SUBTREE "/%s/%s/%u", setting->custom_subsystem_id,
-                       setting->array_key, setting->array_index);
+                       zmk_custom_setting_public_key(setting), setting->array_index);
     } else {
         ret = snprintf(name, name_size, SETTINGS_SUBTREE "/%s/%s", setting->custom_subsystem_id,
                        setting->key);
@@ -1139,7 +1104,7 @@ int zmk_custom_setting_serialize_rpc_value(const struct zmk_custom_setting *sett
             zmk_custom_setting_keyspace_of(setting);
         return convert_rpc_bytes_value(setting, internal_value, rpc_value,
                                        keyspace ? keyspace->rpc_serializer
-                                                : setting->rpc_serializer);
+                                                : zmk_custom_setting_rpc_serializer(setting));
     }
     if (!setting || !internal_value || !rpc_value) {
         return -EINVAL;
@@ -1156,7 +1121,7 @@ int zmk_custom_setting_deserialize_rpc_value(const struct zmk_custom_setting *se
             zmk_custom_setting_keyspace_of(setting);
         return convert_rpc_bytes_value(setting, rpc_value, internal_value,
                                        keyspace ? keyspace->rpc_deserializer
-                                                : setting->rpc_deserializer);
+                                                : zmk_custom_setting_rpc_deserializer(setting));
     }
     if (!setting || !rpc_value || !internal_value) {
         return -EINVAL;
@@ -1362,7 +1327,8 @@ int zmk_custom_setting_discard(const struct zmk_custom_setting *const_setting) {
             struct zmk_custom_setting_array_state *array_state = setting->array_state;
             uint32_t restore_size = array_state->persistent_size;
             for (uint32_t index = 0; index < restore_size; index++) {
-                struct zmk_custom_setting *view = array_view_acquire(setting, index);
+                struct zmk_custom_setting view_storage;
+                struct zmk_custom_setting *view = array_view_init(&view_storage, setting, index);
                 discard_array_element_locked(view);
             }
             set_array_memory_size_locked(setting, restore_size);
@@ -1416,7 +1382,8 @@ int zmk_custom_setting_reset(const struct zmk_custom_setting *const_setting) {
              * including the "_size" marker. */
             uint32_t reset_size = array_state->size;
             for (uint32_t index = 0; index < reset_size && ret == 0; index++) {
-                struct zmk_custom_setting *view = array_view_acquire(setting, index);
+                struct zmk_custom_setting view_storage;
+                struct zmk_custom_setting *view = array_view_init(&view_storage, setting, index);
                 ret = reset_array_element_locked(view);
             }
             if (ret == 0) {
@@ -1546,8 +1513,10 @@ static int apply_scope_to_setting(const struct zmk_custom_setting *setting,
         k_mutex_unlock(&custom_settings_lock);
 
         for (uint32_t index = 0; index < active_size; index++) {
-            const struct zmk_custom_setting *view = zmk_custom_setting_find_array_element(
-                setting->custom_subsystem_id, setting->array_key, index);
+            struct zmk_custom_setting view_storage;
+            const struct zmk_custom_setting *view =
+                array_view_find(&view_storage, setting->custom_subsystem_id,
+                                zmk_custom_setting_public_key(setting), index);
             if (!view) {
                 continue;
             }
@@ -2124,9 +2093,9 @@ static int custom_settings_handle_set(const char *name, size_t len, settings_rea
     char array_key[CONFIG_ZMK_CUSTOM_SETTINGS_KEY_MAX_LEN];
     if (IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY) &&
         split_array_size_key(next, array_key, sizeof(array_key))) {
+        struct zmk_custom_setting setting_storage;
         struct zmk_custom_setting *setting =
-            (struct zmk_custom_setting *)zmk_custom_setting_find_array_element(custom_subsystem_id,
-                                                                               array_key, 0);
+            array_view_find(&setting_storage, custom_subsystem_id, array_key, 0);
         if (!setting) {
             return -ENOENT;
         }
@@ -2148,6 +2117,7 @@ static int custom_settings_handle_set(const char *name, size_t len, settings_rea
     }
 
     struct zmk_custom_setting *setting;
+    struct zmk_custom_setting load_view;
     uint32_t element_index;
     if (IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY) &&
         split_array_element_key(next, array_key, sizeof(array_key), &element_index)) {
@@ -2155,8 +2125,7 @@ static int custom_settings_handle_set(const char *name, size_t len, settings_rea
          * ZMK_CUSTOM_SETTING_ARRAY_DEFINE), so a stored "array_key/index"
          * name is resolved through the index-view mechanism instead of a
          * direct registry lookup by key. */
-        setting = (struct zmk_custom_setting *)zmk_custom_setting_find_array_element(
-            custom_subsystem_id, array_key, element_index);
+        setting = array_view_find(&load_view, custom_subsystem_id, array_key, element_index);
     } else {
         setting = (struct zmk_custom_setting *)zmk_custom_setting_find(custom_subsystem_id, next);
         if (!setting) {

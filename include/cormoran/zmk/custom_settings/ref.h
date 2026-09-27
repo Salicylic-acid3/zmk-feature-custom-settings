@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #pragma once
 #include <stdint.h>
+#include <cormoran/zmk/custom_settings.h>
 #include <stdbool.h>
 
 struct zmk_custom_setting;
@@ -30,3 +31,19 @@ int zmk_custom_setting_ref_visit(const struct zmk_custom_setting_ref *ref,
                                  zmk_custom_setting_ref_visitor_t visit, void *context);
 bool zmk_custom_setting_ref_equal(const struct zmk_custom_setting_ref *a,
                                   const struct zmk_custom_setting_ref *b);
+
+/* Resolve an identity without allocating a legacy view. Use ARRAY_NONE for a
+ * scalar, keyspace key or array parent. An inactive index resolves, but read
+ * fails with ENOENT until it becomes active. */
+int zmk_custom_setting_ref_find(const char *subsystem, const char *key, uint32_t index,
+                                struct zmk_custom_setting_ref *ref);
+/* Copies into caller storage; no borrowed pool pointer crosses the lock. */
+int zmk_custom_setting_ref_read_into(const struct zmk_custom_setting_ref *ref, void *buffer,
+                                     size_t capacity, size_t *size,
+                                     enum zmk_custom_setting_value_type *type);
+
+/* Copies a value using the setting's declared type. Scalars use the same
+ * native C representation as read_into; STRING length excludes the NUL.
+ * Input is borrowed only for this call, including pool-backed inputs. */
+int zmk_custom_setting_ref_write(const struct zmk_custom_setting_ref *ref, const void *data,
+                                 size_t size, enum zmk_custom_setting_write_mode mode);

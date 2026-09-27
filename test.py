@@ -53,11 +53,49 @@ class WestCommandsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS: test", result.stdout, result.stdout + result.stderr)
         self.assertIn("PASS: studio", result.stdout, result.stdout + result.stderr)
+        for suite in ("compact_test", "compact_studio", "compact_split_peripheral"):
+            self.assertIn(
+                f"PASS: {suite}", result.stdout, result.stdout + result.stderr
+            )
         self.assertNotIn("FAILED: ", result.stdout, result.stdout + result.stderr)
 
     def test_zmk_build(self):
         self._test_zmk_build(
             {
+                "custom_settings_board_typed_compat": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT=y",
+                        "CONFIG_ZMK_CUSTOM_SETTINGS_ZMK_CONFIG_TYPED_SAMPLES=y",
+                    ],
+                    device=[],
+                    binary=[b"compact_array", b"array_view_pool"],
+                ),
+                "custom_settings_board_compact": ConfigAndDeviceTree(
+                    config=[
+                        "# CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT is not set",
+                        "CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY=y",
+                    ],
+                    device=[],
+                    binary=[
+                        b"compact_array",
+                        NotFound("array_view_pool"),
+                        NotFound("zmk_custom_setting_find_array_element"),
+                        NotFound("zmk_custom_setting_set_default"),
+                    ],
+                ),
+                "custom_settings_split_peripheral_compact": ConfigAndDeviceTree(
+                    config=[
+                        "# CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT is not set",
+                        "CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY=y",
+                    ],
+                    device=[],
+                    binary=[
+                        b"compact_array",
+                        NotFound("array_view_pool"),
+                        NotFound("zmk_custom_setting_find_array_element"),
+                        NotFound("zmk_custom_setting_set_default"),
+                    ],
+                ),
                 "custom_settings_board_feature_disabled": ConfigAndDeviceTree(
                     config=[
                         'CONFIG_ZMK_KEYBOARD_NAME="Module Test"',

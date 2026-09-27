@@ -24,8 +24,13 @@ int write_large_locked(const struct zmk_custom_setting *setting, const void *dat
                        enum zmk_custom_setting_write_mode mode);
 
 /* Array lifecycle helpers; storage/bitsets live in array_storage.h. */
-struct zmk_custom_setting *array_view_acquire(const struct zmk_custom_setting *array_descriptor,
-                                              uint32_t index);
+#include "custom_settings_views.h"
+void apply_scalar_default_locked(const struct zmk_custom_setting *setting);
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+int compat_blob_store_set_raw(const struct zmk_custom_setting *setting, const void *data,
+                              size_t size);
+bool compat_array_default(const struct zmk_custom_setting *array, uint32_t index);
+#endif
 
 void set_array_memory_size_locked(const struct zmk_custom_setting *array_element,
                                   uint32_t array_size);
