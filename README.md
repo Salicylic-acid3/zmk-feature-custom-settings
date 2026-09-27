@@ -1038,7 +1038,7 @@ response size is checked at compile time against
 `CONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RESPONSE_BUFFER_SIZE` (264 B on ARM32).
 
 Run `python3 -m unittest -v` in the workspace devShell for the host allocator,
-native_sim snapshots and six firmware builds. Outputs are worktree-local under
+six native_sim suites and nine firmware builds. Outputs are worktree-local under
 `build/`. `python3 -m unittest test_pool -v` runs the allocator's deterministic
 20,000-operation invariant test with UndefinedBehaviorSanitizer without Zephyr.
 
