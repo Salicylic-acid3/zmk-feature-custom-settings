@@ -9,11 +9,11 @@
  * which selects CONFIG_ZMK_CUSTOM_SETTINGS_LARGE_VALUES). A keyspace slot's
  * entire entry - its user key *and* its payload - is one opaque pool-backed
  * BYTES blob, so this feature cannot link without the pool
- * (src/custom_settings_pool.c).
+ * (custom_settings_blob.c / custom_settings_allocator.c).
  *
- * This file is the only keyspace-aware code in the module: the
- * presentation/lookup layer. Everything else (storage, pool, generic value
- * read/write/save) treats a slot as a plain pooled BYTES setting. Core call
+ * This file owns key lookup and payload presentation. Core and ref code
+ * dispatch keyspace operations here; storage and the allocator see pooled
+ * bytes, regardless of the payload type presented to callers. Core call
  * sites guard their use of this file's entry points with
  * zmk_custom_setting_keyspace_of(), which folds to a compile-time constant
  * NULL when the feature is off, so none of these functions are reachable in a

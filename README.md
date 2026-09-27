@@ -1190,3 +1190,11 @@ contracts; `compat/state.h` retains the legacy 20-byte union layout when
 compatibility is ON. Access state through the matching
 `zmk_custom_setting_state_int32/bool/behavior/blob()` accessor while holding the
 settings lock; ordinary consumers should prefer the getter/setter APIs.
+
+### コード構造とメモリ構造のガイド
+
+`web` の Settings console 上部にある「コードとメモリの構造」から、接続不要の
+専用ページ `architecture.html` を開けます。ファイルの読み順、互換 ON/OFF、
+value と state の違い、ポインタの寿命、配列・pool・keyspace の配置、DYA2 の
+計測結果を図で説明しています。起動方法は [web/README.md](web/README.md)、
+可読性レビューの判断は [レビュー記録](docs/design/code-readability-review.md) を参照してください。

@@ -107,6 +107,8 @@ int blob_store_set_raw(const struct zmk_custom_setting *setting, const void *dat
 
 size_t bounded_strlen(const char *str, size_t max_len);
 
+/* dest.size is capacity on entry, payload length on success. Pointer payloads
+ * are copied into caller storage; reset the output buffer before each reuse. */
 int copy_value(struct zmk_custom_setting_value_view *dest,
                const struct zmk_custom_setting_value_view *src);
 
@@ -115,6 +117,8 @@ int value_to_storage(const struct zmk_custom_setting_value_view *value, const vo
 
 int setting_storage_name(const struct zmk_custom_setting *setting, char *name, size_t name_size);
 
+/* Returns shared scratch or borrowed storage. Consume under the lock before
+ * another settings operation; holding the recursive mutex alone is not enough. */
 const struct zmk_custom_setting_value_view *
 effective_value(const struct zmk_custom_setting *setting);
 

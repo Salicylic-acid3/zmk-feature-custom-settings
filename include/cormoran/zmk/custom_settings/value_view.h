@@ -50,6 +50,10 @@ int zmk_custom_setting_array_remove_at_view(
     struct zmk_custom_setting_value_view *out_value, enum zmk_custom_setting_write_mode mode);
 int zmk_custom_setting_validate_view(const struct zmk_custom_setting *setting,
                                      const struct zmk_custom_setting_value_view *value);
+/* Visits synchronously under the settings lock. Neither the view nor its
+ * payload may escape. Do not call settings APIs: a nested read may overwrite
+ * shared scratch, and a write may move the pool bytes backing this view.
+ * Unlike ref_visit, this callback borrows the value itself. */
 int zmk_custom_setting_with_view(const struct zmk_custom_setting *setting,
                                  zmk_custom_setting_view_visitor_t visitor, void *user_data);
 int zmk_custom_setting_keyspace_create_view(struct zmk_custom_setting_keyspace *keyspace,
