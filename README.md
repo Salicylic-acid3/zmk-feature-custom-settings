@@ -1023,6 +1023,20 @@ backend failure preserves the old base, dirty state and temporary override.
 Array and scope saves still consist of multiple records and are not atomic as a
 whole. Flash I/O still holds the settings lock in this compatibility stage.
 
+Studio RPC also incorporates the memory optimizations and relay metadata fix
+from [PR #59](https://github.com/cormoran/zmk-feature-custom-settings/pull/59).
+Constraint metadata is encoded on demand rather than embedded at its worst-case
+size in every message. The central omits the peripheral request worker/buffers;
+relayed constraints are preserved in a bounded encoded buffer.
+
+Custom-settings responses use the shared helper in
+`<cormoran/zmk/custom_settings_studio.h>`. Other modules keep their own buffers
+unless they explicitly adopt it. Its lifetime is the serial Studio request /
+encode loop: encode before the next allocation; a generation check rejects stale
+encoders but does not provide synchronization for concurrent callers. The
+response size is checked at compile time against
+`CONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RESPONSE_BUFFER_SIZE` (264 B on ARM32).
+
 Run `python3 -m unittest -v` in the workspace devShell for the host allocator,
 native_sim snapshots and six firmware builds. Outputs are worktree-local under
 `build/`. `python3 -m unittest test_pool -v` runs the allocator's deterministic
