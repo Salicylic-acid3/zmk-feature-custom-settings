@@ -33,30 +33,12 @@
 #include <cormoran/zmk/custom_settings.h>
 
 #include "custom_settings_internal.h"
+#include "custom_settings_array_storage.h"
 
-/*
- * Array element "index views": zmk_custom_setting_find_array_element hands
- * out a struct zmk_custom_setting * for one (array descriptor, index) pair
- * without registering a real STRUCT_SECTION_ITERABLE entry per element (see
- * struct zmk_custom_setting_array_state in the header). Views are pulled
- * from this small direct-mapped pool and reused for the same (array, index)
- * pair across calls, so a pointer returned earlier keeps working correctly
- * (including any temp_slot it owns) even if other lookups happened in
- * between - this matters for callers like test_temporary_override_pool that
- * hold onto array element pointers across several calls.
- *
- * Pool size is bounded by CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY_VIEW_POOL_SIZE;
- * it only needs to cover how many distinct array elements are referenced at
- * once (RPC handling, list enumeration, tests), not array length itself.
- */
+/* Legacy pointer adapter. New retained references use owner/index/generation
+ * and resolve into a caller-local view, without consuming this cache. */
 struct zmk_custom_setting_array_view_slot {
     bool in_use;
-    /* A view is a runtime-built RAM instance of the (normally const/flash)
-     * struct zmk_custom_setting, so it embeds its own state block; the only
-     * view state that actually matters is the TEMPORARY_ACTIVE flag +
-     * temp_slot (element values/dirty/has_persistent live in the shared
-     * array_state). */
-    struct zmk_custom_setting_state state;
     struct zmk_custom_setting view;
 };
 
@@ -82,18 +64,9 @@ struct zmk_custom_setting *array_view_acquire(const struct zmk_custom_setting *a
     }
 
     if (!free_slot) {
-        /* Pool exhausted: recycle slot 0. Before overwriting it, release any
-         * temporary override the evicted view still owns. Ownership in
-         * temp_slots is tracked by view pointer, so without this the evicted
-         * element's temp slot would be leaked forever (in_use, but its owner
-         * address is about to be reused for a different element) and could
-         * later be aliased by owner-pointer to the new element that reuses
-         * this same view address. A caller still holding a stale pointer for
-         * the evicted (array, index) will observe the override cleared along
-         * with the value being redirected to the new element - an inherent
-         * limitation of holding a pointer past pool eviction. */
+        /* Only the legacy pointer adapter is recycled. Temporary overlays
+         * belong to (array, index), so eviction cannot discard a value. */
         free_slot = &array_view_pool[0];
-        clear_temporary_locked(&free_slot->view);
     }
 
     free_slot->in_use = true;
@@ -101,24 +74,8 @@ struct zmk_custom_setting *array_view_acquire(const struct zmk_custom_setting *a
     free_slot->view.array_index = index;
     free_slot->view.array_state = array_descriptor->array_state;
     free_slot->view.default_value = NULL;
-    /* Redirect the copied descriptor's state pointer away from the array
-     * descriptor's own state block to this view's embedded one, then reset
-     * it. */
-    free_slot->state = (struct zmk_custom_setting_state){.temp_slot = -1};
-    free_slot->view.state = &free_slot->state;
+    free_slot->view.state = array_descriptor->state;
     return &free_slot->view;
-}
-
-/* Non-static: the core flag helpers (set_setting_dirty/setting_is_dirty/
- * setting_has_persistent_value/set_setting_has_persistent_value in
- * custom_settings.c) call these for an array element. Declared in
- * custom_settings_internal.h. */
-bool *array_dirty_slot(const struct zmk_custom_setting *setting) {
-    return &setting->array_state->dirty[setting->array_index];
-}
-
-bool *array_has_persistent_slot(const struct zmk_custom_setting *setting) {
-    return &setting->array_state->has_persistent[setting->array_index];
 }
 
 const struct zmk_custom_setting *zmk_custom_setting_find_array(const char *custom_subsystem_id,
@@ -166,21 +123,11 @@ static int validate_array_size(const struct zmk_custom_setting *setting, uint32_
     return array_size <= setting->array_state->max_size ? 0 : -ERANGE;
 }
 
-/* Clear any active temporary override on array elements at or past
- * new_size. Only live view-pool slots for this array can have an active
- * override (temp_slot lives on the view instance, not in array_state), so
- * this scans the bounded pool instead of the (potentially much larger)
- * array itself. */
+/* Inactive indices cannot retain temporary overrides. */
 static void
 clear_temporary_past_size_locked(const struct zmk_custom_setting_array_state *array_state,
                                  uint32_t new_size) {
-    for (size_t i = 0; i < ARRAY_SIZE(array_view_pool); i++) {
-        struct zmk_custom_setting_array_view_slot *slot = &array_view_pool[i];
-        if (slot->in_use && slot->view.array_state == array_state &&
-            slot->view.array_index >= new_size) {
-            clear_temporary_locked(&slot->view);
-        }
-    }
+    clear_array_temporary_locked(array_state, new_size);
 }
 
 /* Non-static: zmk_custom_setting_discard/zmk_custom_setting_reset
@@ -241,7 +188,7 @@ static int delete_inactive_array_values_locked(const struct zmk_custom_setting *
     struct zmk_custom_setting_array_state *array_state = array_descriptor->array_state;
 
     for (uint32_t index = array_size; index < array_state->max_size; index++) {
-        if (!array_state->has_persistent[index]) {
+        if (!array_flag_get(array_state->has_persistent, index)) {
             continue;
         }
 
@@ -258,8 +205,8 @@ static int delete_inactive_array_values_locked(const struct zmk_custom_setting *
             return ret;
         }
 
-        array_state->has_persistent[index] = false;
-        array_state->dirty[index] = true;
+        array_flag_set(array_state->has_persistent, index, false);
+        array_flag_set(array_state->dirty, index, true);
     }
 
     return 0;
@@ -296,7 +243,9 @@ int save_array_locked(const struct zmk_custom_setting *array_descriptor) {
 
         const void *data;
         size_t len;
-        ret = value_to_storage(&array_state->values[index], &data, &len);
+        struct zmk_custom_setting_value value;
+        array_value_read(array_descriptor, index, &value);
+        ret = value_to_storage(&value, &data, &len);
         if (ret < 0) {
             return ret;
         }
@@ -306,8 +255,8 @@ int save_array_locked(const struct zmk_custom_setting *array_descriptor) {
             return ret;
         }
 
-        array_state->has_persistent[index] = true;
-        array_state->dirty[index] = false;
+        array_flag_set(array_state->has_persistent, index, true);
+        array_flag_set(array_state->dirty, index, false);
     }
 
     set_array_persistent_size_locked(array_descriptor, array_size);
@@ -362,9 +311,19 @@ int zmk_custom_setting_write_array_element(const struct zmk_custom_setting *cons
     }
 
     k_mutex_lock(&custom_settings_lock, K_FOREVER);
-    set_array_memory_size_locked(setting, array_size);
-
-    ret = write_value_locked(setting, value, mode);
+    uint32_t old_size = setting->array_state->size;
+    ret = write_value_locked(setting, value,
+                             mode == ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST
+                                 ? ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY
+                                 : mode);
+    if (ret == 0) {
+        set_array_memory_size_locked(setting, array_size);
+        if (mode == ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST) {
+            ret = save_setting_locked(setting);
+        }
+    } else {
+        setting->array_state->size = old_size;
+    }
 
     k_mutex_unlock(&custom_settings_lock);
 
@@ -467,6 +426,11 @@ int zmk_custom_setting_array_insert_at(const struct zmk_custom_setting *const_se
         return -EINVAL;
     }
 
+    if (mode != ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY &&
+        mode != ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST) {
+        return -EINVAL;
+    }
+
     struct zmk_custom_setting *setting = (struct zmk_custom_setting *)const_setting;
     int ret = zmk_custom_setting_validate(setting, value);
     if (ret < 0) {
@@ -486,26 +450,20 @@ int zmk_custom_setting_array_insert_at(const struct zmk_custom_setting *const_se
         return -ERANGE;
     }
 
-    /* Shift [index, array_size) one slot later over the single contiguous
-     * buffer instead of requiring N individual element writes - the whole
-     * point of a contiguous backing buffer. Any temp override on a shifted
-     * element is cleared (its underlying value moved), matching how
-     * set_array_memory_size_locked/clear_temporary_past_size_locked already
-     * treat elements that fall out of the valid range on resize. */
-    uint32_t move_count = array_size - index;
-    if (move_count > 0) {
-        memmove(&array_state->values[index + 1], &array_state->values[index],
-                move_count * sizeof(array_state->values[0]));
-        memmove(&array_state->dirty[index + 1], &array_state->dirty[index],
-                move_count * sizeof(array_state->dirty[0]));
-        memmove(&array_state->has_persistent[index + 1], &array_state->has_persistent[index],
-                move_count * sizeof(array_state->has_persistent[0]));
-        clear_temporary_past_size_locked(array_state, index);
+    /* Stage the new element in the inactive tail before shifting. Pool
+     * exhaustion must leave every active element and flag unchanged. */
+    ret = array_value_write(setting, array_size, value);
+    if (ret < 0) {
+        k_mutex_unlock(&custom_settings_lock);
+        return ret;
     }
-
-    copy_value(&array_state->values[index], value);
-    array_state->dirty[index] = true;
-    array_state->has_persistent[index] = false;
+    for (uint32_t i = array_size; i > index; --i) {
+        array_value_swap(setting, i, i - 1);
+    }
+    for (uint32_t i = index; i <= array_size; ++i) {
+        array_flag_set(array_state->dirty, i, true);
+    }
+    clear_temporary_past_size_locked(array_state, index);
     array_state->size = array_size + 1;
 
     struct zmk_custom_setting *view = array_view_acquire(setting, index);
@@ -543,6 +501,11 @@ int zmk_custom_setting_array_remove_at(const struct zmk_custom_setting *const_se
         return -EINVAL;
     }
 
+    if (mode != ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY &&
+        mode != ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST) {
+        return -EINVAL;
+    }
+
     struct zmk_custom_setting *setting = (struct zmk_custom_setting *)const_setting;
 
     k_mutex_lock(&custom_settings_lock, K_FOREVER);
@@ -560,21 +523,13 @@ int zmk_custom_setting_array_remove_at(const struct zmk_custom_setting *const_se
     }
     clear_temporary_past_size_locked(array_state, index);
 
-    /* Shift [index + 1, array_size) one slot earlier over the single
-     * contiguous buffer instead of requiring N individual element writes. */
-    uint32_t move_count = array_size - index - 1;
-    if (move_count > 0) {
-        memmove(&array_state->values[index], &array_state->values[index + 1],
-                move_count * sizeof(array_state->values[0]));
-        memmove(&array_state->dirty[index], &array_state->dirty[index + 1],
-                move_count * sizeof(array_state->dirty[0]));
-        memmove(&array_state->has_persistent[index], &array_state->has_persistent[index + 1],
-                move_count * sizeof(array_state->has_persistent[0]));
-        clear_temporary_past_size_locked(array_state, array_size - 1);
+    for (uint32_t i = index; i + 1 < array_size; ++i) {
+        array_value_swap(setting, i, i + 1);
+        array_flag_set(array_state->dirty, i, true);
     }
-
+    array_value_default(setting, array_size - 1);
     array_state->size = array_size - 1;
-    array_state->dirty[array_size - 1] = true;
+    array_flag_set(array_state->dirty, array_size - 1, true);
 
     struct zmk_custom_setting *tail_view = array_view_acquire(setting, array_size - 1);
     int ret = 0;
@@ -615,7 +570,7 @@ int discard_array_element_locked(struct zmk_custom_setting *view) {
 
     set_array_memory_size_locked(view, array_state->persistent_size);
 
-    if (array_state->has_persistent[index]) {
+    if (array_flag_get(array_state->has_persistent, index)) {
         /* No RAM-resident persistent_value copy is kept; re-read the
          * persisted value from flash straight into the buffer slot.
          * Discard is a rare, explicit user action, so a flash read here is
@@ -626,12 +581,12 @@ int discard_array_element_locked(struct zmk_custom_setting *view) {
             ret = settings_load_subtree(name);
         }
         if (ret < 0) {
-            copy_value(&array_state->values[index], &array_state->defaults[index]);
+            array_value_default(view, index);
         }
     } else {
-        copy_value(&array_state->values[index], &array_state->defaults[index]);
+        array_value_default(view, index);
     }
-    array_state->dirty[index] = false;
+    array_flag_set(array_state->dirty, index, false);
     clear_temporary_locked(view);
     return 0;
 }
@@ -659,9 +614,9 @@ int reset_array_element_locked(struct zmk_custom_setting *view) {
         return ret;
     }
 
-    copy_value(&array_state->values[index], &array_state->defaults[index]);
-    array_state->has_persistent[index] = false;
-    array_state->dirty[index] = false;
+    array_value_default(view, index);
+    array_flag_set(array_state->has_persistent, index, false);
+    array_flag_set(array_state->dirty, index, false);
     clear_temporary_locked(view);
     return 0;
 }

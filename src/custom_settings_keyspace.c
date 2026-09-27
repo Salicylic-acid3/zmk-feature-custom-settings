@@ -118,7 +118,7 @@ static int keyspace_slot_index_for_key_locked(struct zmk_custom_setting_keyspace
 
 static int keyspace_free_slot_index_locked(struct zmk_custom_setting_keyspace *keyspace) {
     for (uint32_t i = 0; i < keyspace->max_entries; i++) {
-        if (!keyspace->slots[i].in_use) {
+        if (!keyspace->slots[i].in_use && keyspace->slots[i].generation != UINT32_MAX) {
             return (int)i;
         }
     }
@@ -137,16 +137,19 @@ struct zmk_custom_setting *keyspace_bind_slot_locked(struct zmk_custom_setting_k
                                                      uint32_t index) {
     struct zmk_custom_setting_keyspace_slot *slot = &keyspace->slots[index];
 
-    snprintf(slot->ordinal_name, sizeof(slot->ordinal_name), "%s#%u", keyspace->key_prefix, index);
+    if (slot->generation == UINT32_MAX) {
+        return NULL; /* Retire instead of making an old ref valid again. */
+    }
+    slot->generation++;
 
     /* Reset the slot's embedded state block first: a freshly bound slot
      * starts with an empty blob (data == NULL - its region is carved from the
      * pool on the first write/load), no flags, no temp slot, and no default
      * override left over from a previous occupant. */
-    slot->state = (struct zmk_custom_setting_state){.temp_slot = -1};
+    slot->state = (struct zmk_custom_setting_state){0};
     slot->setting = (struct zmk_custom_setting){
         .custom_subsystem_id = keyspace->custom_subsystem_id,
-        .key = slot->ordinal_name,
+        .key = keyspace->key_prefix,
         .array_key = NULL,
         .array_index = ZMK_CUSTOM_SETTING_ARRAY_NONE,
         .value_type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES,
@@ -199,6 +202,7 @@ int keyspace_validate_payload(const struct zmk_custom_setting_keyspace *keyspace
                               const struct zmk_custom_setting_value *value) {
     struct zmk_custom_setting payload_shape = {
         .value_type = keyspace->value_type,
+        .blob.max_size = keyspace->max_size,
         .constraints = keyspace->constraints,
         .constraints_count = keyspace->constraints_count,
     };
@@ -217,13 +221,6 @@ int keyspace_validate_payload(const struct zmk_custom_setting_keyspace *keyspace
     return 0;
 }
 
-/* Scratch buffer for assembling a keyspace slot's `[user_key\0][payload]`
- * blob before handing it to write_bytes_raw. Sized to cover any registered
- * keyspace regardless of its own (smaller) per-instance limits. Safe as a
- * single shared instance: assembled and consumed synchronously within one
- * write call. */
-static uint8_t keyspace_blob_scratch[ZMK_CUSTOM_SETTINGS_KEYSPACE_BLOB_SCRATCH_SIZE];
-
 /* Shared blob assembly for keyspace_write_blob (typed payload) and
  * keyspace_write_raw_payload (already-raw payload): builds
  * `blob = [key\0][payload]` and writes it via write_bytes_raw (the
@@ -234,32 +231,26 @@ static int keyspace_write_raw_payload_with_key(const struct zmk_custom_setting *
                                                const char *key, const void *payload_data,
                                                size_t payload_len,
                                                enum zmk_custom_setting_write_mode mode) {
-    size_t key_len;
-    if (key != NULL) {
-        key_len = strlen(key);
-        if (key_len + 1 > sizeof(keyspace_blob_scratch)) {
-            return -ENAMETOOLONG;
-        }
-        memcpy(keyspace_blob_scratch, key, key_len);
-    } else {
-        k_mutex_lock(&custom_settings_lock, K_FOREVER);
-        key_len = keyspace_blob_key_len_locked(setting);
-        key_len = MIN(key_len, sizeof(keyspace_blob_scratch) - 1);
-        if (setting->state->blob.data != NULL && key_len > 0) {
-            memcpy(keyspace_blob_scratch, setting->state->blob.data, key_len);
-        }
-        k_mutex_unlock(&custom_settings_lock);
+    char key_copy[CONFIG_ZMK_CUSTOM_SETTINGS_KEY_MAX_LEN];
+    k_mutex_lock(&custom_settings_lock, K_FOREVER);
+    if (!key) {
+        key = keyspace_public_key_locked(setting);
     }
-    keyspace_blob_scratch[key_len] = '\0';
-
-    if (key_len + 1 + payload_len > sizeof(keyspace_blob_scratch)) {
+    size_t key_len = bounded_strlen(key, sizeof(key_copy));
+    if (key_len >= sizeof(key_copy) || payload_len > CUSTOM_SETTINGS_EDIT_SIZE - key_len - 1) {
+        k_mutex_unlock(&custom_settings_lock);
         return -EMSGSIZE;
     }
-    if (payload_len > 0) {
-        memcpy(keyspace_blob_scratch + key_len + 1, payload_data, payload_len);
+    memcpy(key_copy, key, key_len + 1);
+    /* Payload may already be in this workspace (record encode), or may
+     * alias the live pool. Copy it before writing the prefix. */
+    if (payload_len) {
+        memmove(custom_settings_edit_bytes + key_len + 1, payload_data, payload_len);
     }
-
-    return write_bytes_raw(setting, keyspace_blob_scratch, key_len + 1 + payload_len, mode);
+    memcpy(custom_settings_edit_bytes, key_copy, key_len + 1);
+    int ret = write_bytes_raw(setting, custom_settings_edit_bytes, key_len + 1 + payload_len, mode);
+    k_mutex_unlock(&custom_settings_lock);
+    return ret;
 }
 
 /* `value` (typed as keyspace->value_type) is converted to raw payload bytes

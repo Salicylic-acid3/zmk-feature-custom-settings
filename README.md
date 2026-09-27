@@ -991,3 +991,39 @@ CI runs this automatically in the `Renode custom-settings wired-split relay test
 job, via `zmk-west-commands`' [`zmk-renode-test` composite
 action](https://github.com/cormoran/zmk-west-commands/tree/main/.github/actions/zmk-renode-test)
 (which installs Renode + the protobuf/protoc deps for you).
+
+## Memory redesign implementation
+
+Start with the illustrated [implementation review guide](docs/design/memory-redesign-implementation.html)
+(open the saved HTML in a browser). It maps the code, lifetime rules, memory
+measurements, tests, and the remaining compatibility work against the original
+[design proposal](docs/design/memory-pool-redesign.html).
+
+Plain STRING/BYTES settings and variable array elements now share
+`CONFIG_ZMK_CUSTOM_SETTINGS_POOL_SIZE` bytes (default 512). Unchanged defaults
+borrow ROM. A write that exceeds this total budget returns `-ENOSPC` and preserves
+the old value. Use `_POOLED` or `_SIZED` when a setting needs a separate reserved
+budget. Small pooled values work with `LARGE_VALUES=n`.
+
+Array defaults are typed arrays (`int32_t`, `bool`, behavior bindings, or
+`struct zmk_custom_setting_slice` for STRING/BYTES), with one entry per maximum
+index. `ARRAY_DEFAULT_INT32_DEFINE` keeps the same invocation syntax. Values and
+dirty/persistent bitsets are stored separately. Handwritten arrays of value
+carriers remain supported by a default-only adapter; migrate them to typed
+defaults to recover their ROM cost. Live arrays are typed in either case.
+
+For retained identities, include `<cormoran/zmk/custom_settings/ref.h>`, capture
+a `zmk_custom_setting_ref` immediately after lookup, and use `ref_visit()` for
+subsequent synchronous access. Array refs address an index; keyspace refs reject
+deleted/reused slots with `-ESTALE`. A visitor's descriptor must not escape the
+callback. The old `find_array_element()` pointer remains a borrowed cache view.
+
+Single-setting PERSIST writes now save the candidate before publishing RAM:
+backend failure preserves the old base, dirty state and temporary override.
+Array and scope saves still consist of multiple records and are not atomic as a
+whole. Flash I/O still holds the settings lock in this compatibility stage.
+
+Run `python3 -m unittest -v` in the workspace devShell for the host allocator,
+native_sim snapshots and six firmware builds. Outputs are worktree-local under
+`build/`. `python3 -m unittest test_pool -v` runs the allocator's deterministic
+20,000-operation invariant test with UndefinedBehaviorSanitizer without Zephyr.

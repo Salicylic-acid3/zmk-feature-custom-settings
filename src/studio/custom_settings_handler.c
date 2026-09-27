@@ -17,6 +17,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 #include <cormoran/zmk/custom_settings.h>
+#include <cormoran/zmk/custom_settings/ref.h>
 #include <cormoran/zmk/custom_settings/custom_settings.pb.h>
 #include <cormoran/zmk/custom_settings/custom_settings_relay.pb.h>
 #include <zmk/workqueue.h>
@@ -2103,7 +2104,7 @@ static int handle_delete_setting(const cormoran_zmk_custom_settings_DeleteSettin
 #if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS_CHUNKED_RPC) && ZMK_CUSTOM_SETTINGS_LOCAL_STUDIO_RPC
 struct zmk_custom_settings_chunk_session {
     bool active;
-    const struct zmk_custom_setting *setting;
+    struct zmk_custom_setting_ref ref;
     uint32_t total_size;
     uint32_t received;
     cormoran_zmk_custom_settings_SettingWriteMode mode;
@@ -2121,6 +2122,29 @@ static bool chunk_value_type_supported(const struct zmk_custom_setting *setting)
 
 static void reset_chunk_session_locked(void) {
     chunk_session = (struct zmk_custom_settings_chunk_session){0};
+}
+
+struct chunk_commit_context {
+    const uint8_t *data;
+    size_t size;
+    enum zmk_custom_setting_write_mode mode;
+};
+
+static int commit_chunk_ref(const struct zmk_custom_setting *setting, void *context) {
+    struct chunk_commit_context *commit = context;
+    if (needs_unlock(setting->write_permission)) {
+        return -EACCES;
+    }
+    if (commit->size > CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE) {
+        return zmk_custom_setting_write_bytes(setting, commit->data, commit->size, commit->mode);
+    }
+    struct zmk_custom_setting_value wire = {.type = presented_value_type(setting),
+                                            .size = commit->size};
+    memcpy(wire.bytes_value, commit->data, commit->size);
+    wire.string_value[commit->size] = '\0';
+    struct zmk_custom_setting_value decoded;
+    int ret = zmk_custom_setting_deserialize_rpc_value(setting, &wire, &decoded);
+    return ret < 0 ? ret : zmk_custom_setting_write(setting, &decoded, commit->mode);
 }
 
 static int
@@ -2149,6 +2173,11 @@ handle_private_write_value_chunk(const struct zmk_custom_settings_setting_ref *r
         return 0;
     }
 
+    struct zmk_custom_setting_ref target;
+    int capture_ret = zmk_custom_setting_ref_capture(setting, &target);
+    if (capture_ret < 0) {
+        return capture_ret;
+    }
     k_mutex_lock(&chunk_session_lock, K_FOREVER);
 
     if (offset == 0) {
@@ -2158,10 +2187,11 @@ handle_private_write_value_chunk(const struct zmk_custom_settings_setting_ref *r
         }
         reset_chunk_session_locked();
         chunk_session.active = true;
-        chunk_session.setting = setting;
+        chunk_session.ref = target;
         chunk_session.total_size = total_size;
         chunk_session.mode = write_mode;
-    } else if (!chunk_session.active || chunk_session.setting != setting ||
+    } else if (!chunk_session.active ||
+               !zmk_custom_setting_ref_equal(&chunk_session.ref, &target) ||
                offset != chunk_session.received) {
         /* Out-of-order chunk, or a chunk for a different setting than the
          * transfer that is currently in progress. */
@@ -2196,46 +2226,11 @@ handle_private_write_value_chunk(const struct zmk_custom_settings_setting_ref *r
             ? ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST
             : ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY;
 
-    int ret;
-    if (chunk_session.total_size > CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE) {
-        /* Large value: write the assembled payload straight to the setting's
-         * large store. RPC deserializer converters are bounded by the fixed
-         * carrier and are not applied on this path. The write is done while
-         * still holding chunk_session_lock (consistent lock order:
-         * chunk_session_lock is always taken before custom_settings_lock), then
-         * the session is released. */
-        ret = zmk_custom_setting_write_bytes(setting, chunk_session.buffer,
-                                             chunk_session.total_size, mode);
-        reset_chunk_session_locked();
-        k_mutex_unlock(&chunk_session_lock);
-        if (ret < 0) {
-            return ret;
-        }
-
-        set_status(resp, 1, "Value written from chunks");
-        return 0;
-    }
-
-    struct zmk_custom_setting_value rpc_value = {.type = presented_value_type(setting)};
-    if (rpc_value.type == ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES) {
-        rpc_value.size = chunk_session.total_size;
-        memcpy(rpc_value.bytes_value, chunk_session.buffer, chunk_session.total_size);
-    } else {
-        size_t len = MIN(chunk_session.total_size, CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE);
-        memcpy(rpc_value.string_value, chunk_session.buffer, len);
-        rpc_value.string_value[len] = '\0';
-        rpc_value.size = len;
-    }
-
-    struct zmk_custom_setting_value internal_value;
-    ret = zmk_custom_setting_deserialize_rpc_value(setting, &rpc_value, &internal_value);
+    struct chunk_commit_context context = {
+        .data = chunk_session.buffer, .size = chunk_session.total_size, .mode = mode};
+    int ret = zmk_custom_setting_ref_visit(&chunk_session.ref, commit_chunk_ref, &context);
     reset_chunk_session_locked();
     k_mutex_unlock(&chunk_session_lock);
-    if (ret < 0) {
-        return ret;
-    }
-
-    ret = zmk_custom_setting_write(setting, &internal_value, mode);
     if (ret < 0) {
         return ret;
     }
@@ -2896,7 +2891,7 @@ static void relay_request_work_handler(struct k_work *work) {
 #endif
 
 struct zmk_custom_settings_notification_request {
-    const struct zmk_custom_setting *setting;
+    struct zmk_custom_setting_ref ref;
     cormoran_zmk_custom_settings_SettingNotificationKind kind;
     uint32_t source;
 };
@@ -2907,14 +2902,25 @@ K_MSGQ_DEFINE(notification_msgq, sizeof(struct zmk_custom_settings_notification_
               CONFIG_ZMK_CUSTOM_SETTINGS_NOTIFICATION_QUEUE_SIZE, 4);
 K_WORK_DEFINE(notification_work, notification_work_handler);
 
+static int notify_ref(const struct zmk_custom_setting *setting, void *context) {
+    struct zmk_custom_settings_notification_request *request = context;
+    return raise_setting_notification(setting, request->kind, can_include_value(setting), false,
+                                      false, request->source);
+}
+
 static void notification_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
     struct zmk_custom_settings_notification_request request;
     while (k_msgq_get(&notification_msgq, &request, K_NO_WAIT) == 0) {
-        int ret = raise_setting_notification(request.setting, request.kind,
-                                             can_include_value(request.setting), false, false,
-                                             request.source);
+        /* Match raise_setting_notification's lock order. The ref's identity
+         * remains reserved until the synchronous encoder has consumed it. */
+        k_mutex_lock(&notification_buffer_lock, K_FOREVER);
+        int ret = zmk_custom_setting_ref_visit(&request.ref, notify_ref, &request);
+        k_mutex_unlock(&notification_buffer_lock);
+        if (ret == -ESTALE || ret == -ENOENT) {
+            continue; /* A queued update must never describe a replacement entry. */
+        }
         if (ret < 0) {
             LOG_WRN("Failed to raise custom settings notification: %d", ret);
         }
@@ -2945,11 +2951,14 @@ static int setting_changed_listener(const zmk_event_t *eh) {
 #endif
 
     struct zmk_custom_settings_notification_request request = {
-        .setting = ev->setting,
         .kind = proto_notification_kind(ev->kind),
         .source = ev->source,
     };
-    int ret = k_msgq_put(&notification_msgq, &request, K_NO_WAIT);
+    int ret = zmk_custom_setting_ref_capture(ev->setting, &request.ref);
+    if (ret < 0) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+    ret = k_msgq_put(&notification_msgq, &request, K_NO_WAIT);
     if (ret < 0) {
         LOG_WRN("Failed to queue custom settings notification: %d", ret);
         return ZMK_EV_EVENT_BUBBLE;

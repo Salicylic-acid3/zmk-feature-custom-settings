@@ -23,6 +23,7 @@
 #include <zmk/keymap.h>
 
 #include "custom_settings_internal.h"
+#include "custom_settings_array_storage.h"
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -91,23 +92,14 @@ static void state_flag_set(const struct zmk_custom_setting *setting, uint8_t fla
     }
 }
 
+static int temp_slot_find(const struct zmk_custom_setting *setting);
+
 bool setting_temporary_active(const struct zmk_custom_setting *setting) {
-    return state_flag(setting, ZMK_CUSTOM_SETTING_STATE_TEMPORARY_ACTIVE);
+    return temp_slot_find(setting) >= 0;
 }
 
-/*
- * Per-setting BYTES/STRING blob store.
- *
- * Every non-array BYTES/STRING setting keeps its payload behind
- * state->blob.data: either the exact-size static buffer the plain
- * ZMK_CUSTOM_SETTING_DEFINE macro emits (descriptor blob.pool == NULL; the
- * pointer never changes), or a region carved on demand from a shared pool
- * (ZMK_CUSTOM_SETTING_DEFINE_POOLED / _SIZED's private pool / a keyspace's
- * slot pool; blob.data is NULL until the first non-empty write - see
- * pool_ensure_region() below). These helpers are the single read/write path
- * for blob values of any size, and `blob.pool == NULL` is the only
- * fixed-buffer vs pool-member distinction.
- */
+/* Blob access is shared by default pools, explicitly reserved pools and
+ * legacy hand-written fixed stores. Never retain a data pointer across unlock. */
 size_t setting_capacity(const struct zmk_custom_setting *setting) {
     if (!zmk_custom_setting_is_array(setting) &&
         (setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES ||
@@ -123,25 +115,16 @@ bool setting_uses_blob_store(const struct zmk_custom_setting *setting) {
             setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING);
 }
 
-/* Store `size` raw payload bytes into a blob setting's store. Caller must
- * have validated size <= setting_capacity(setting). For a pooled setting,
- * first (re)points blob.data at a big-enough region via pool_ensure_region(),
- * possibly relocating other members of the same pool; on -ENOSPC nothing is
- * modified. For a fixed-store setting (descriptor blob.pool == NULL) the
- * buffer never moves and, being sized capacity + 1 by the registration
- * macro, always has room for the STRING NUL. */
+/* Store a validated payload. The pooled path snapshots before compaction;
+ * the fixed-store branch supports legacy hand-written descriptors. */
 int blob_store_set_raw(const struct zmk_custom_setting *setting, const void *data, size_t size) {
-    if (IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS_LARGE_VALUES) && setting->blob.pool != NULL) {
-        size_t needed =
-            size + (setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING ? 1 : 0);
-        int ret = pool_ensure_region(setting, needed);
-        if (ret < 0) {
-            return ret;
-        }
+    if (setting->blob.pool != NULL) {
+        return blob_write_locked(setting->blob.pool, &setting->state->blob, data, size,
+                                 setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING);
     }
 
     if (size > 0) {
-        memcpy(setting->state->blob.data, data, size);
+        memmove(setting->state->blob.data, data, size);
     }
     if (setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING &&
         setting->state->blob.data != NULL) {
@@ -203,11 +186,8 @@ static int store_scalar_value_locked(const struct zmk_custom_setting *setting,
     }
 }
 
-/* Apply a scalar setting's default (override or compile-time) to its memory
- * storage. Caller holds custom_settings_lock. An empty (size 0) default never
- * allocates a pool region (blob_store_set_raw's needed == 0 case). A
- * pooled setting whose non-empty default cannot fit its pool at init time
- * logs and leaves the setting without a region rather than failing boot. */
+/* Reverting a pooled blob borrows its default without consuming live bytes.
+ * Runtime defaults follow the same caller-owned lifetime as ROM defaults. */
 static void apply_scalar_default_locked(const struct zmk_custom_setting *setting) {
     if (zmk_custom_setting_keyspace_of(setting)) {
         /* A keyspace slot has no compile-time default payload: its blob
@@ -220,6 +200,16 @@ static void apply_scalar_default_locked(const struct zmk_custom_setting *setting
          * (create). This also means discard()/reset() on a keyspace entry
          * with no persisted record are no-ops rather than reverting to a
          * default unrelated to the entry's own key. */
+        return;
+    }
+    const struct zmk_custom_setting_value *def = setting_default_value(setting);
+    if (setting_uses_blob_store(setting) && setting->blob.pool) {
+        pool_release_locked(setting);
+        setting->state->blob.data = (uint8_t *)def->bytes_value;
+        setting->state->blob.size =
+            setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING
+                ? bounded_strlen(def->string_value, sizeof(def->string_value))
+                : def->size;
         return;
     }
     int ret = store_scalar_value_locked(setting, setting_default_value(setting));
@@ -238,7 +228,8 @@ static void apply_scalar_default_locked(const struct zmk_custom_setting *setting
  */
 struct zmk_custom_settings_temp_slot {
     bool in_use;
-    const struct zmk_custom_setting *owner;
+    const void *owner;
+    uint32_t index;
     enum zmk_custom_setting_value_type type;
     size_t size;
     uint8_t data[CONFIG_ZMK_CUSTOM_SETTINGS_TEMP_SLOT_SIZE];
@@ -345,7 +336,11 @@ void value_from_raw(struct zmk_custom_setting_value *dest, enum zmk_custom_setti
 
 static int temp_slot_find(const struct zmk_custom_setting *setting) {
     for (size_t i = 0; i < ARRAY_SIZE(temp_slots); i++) {
-        if (temp_slots[i].in_use && temp_slots[i].owner == setting) {
+        if (temp_slots[i].in_use &&
+            temp_slots[i].owner == (zmk_custom_setting_is_array(setting)
+                                        ? (const void *)setting->array_state
+                                        : (const void *)setting->state) &&
+            temp_slots[i].index == setting->array_index) {
             return (int)i;
         }
     }
@@ -361,8 +356,11 @@ static int temp_slot_alloc(const struct zmk_custom_setting *setting) {
 
     for (size_t i = 0; i < ARRAY_SIZE(temp_slots); i++) {
         if (!temp_slots[i].in_use) {
-            temp_slots[i] =
-                (struct zmk_custom_settings_temp_slot){.in_use = true, .owner = setting};
+            temp_slots[i] = (struct zmk_custom_settings_temp_slot){
+                .in_use = true,
+                .owner = zmk_custom_setting_is_array(setting) ? (const void *)setting->array_state
+                                                              : (const void *)setting->state,
+                .index = setting->array_index};
             return (int)i;
         }
     }
@@ -376,27 +374,24 @@ static void temp_slot_free(int slot) {
     }
 }
 
-/* Clear an active temporary override, if any, and release its pool slot.
- * Use this instead of clearing the TEMPORARY_ACTIVE state flag directly so
- * the pool slot is not leaked. */
+/* Release a temporary overlay by logical identity, independent of views. */
 void clear_temporary_locked(const struct zmk_custom_setting *setting) {
-    struct zmk_custom_setting_state *state = setting->state;
-    /* Check slot ownership (not just state->temp_slot >= 0) so a state
-     * block that was never initialized to temp_slot = -1 (e.g. a
-     * zero-initialized view-pool entry) cannot free a slot actually owned
-     * by a different setting. */
-    if (state->temp_slot >= 0 && (size_t)state->temp_slot < ARRAY_SIZE(temp_slots) &&
-        temp_slots[state->temp_slot].owner == setting) {
-        temp_slot_free(state->temp_slot);
+    temp_slot_free(temp_slot_find(setting));
+}
+
+void clear_array_temporary_locked(const struct zmk_custom_setting_array_state *array,
+                                  uint32_t first) {
+    for (size_t i = 0; i < ARRAY_SIZE(temp_slots); ++i) {
+        if (temp_slots[i].in_use && temp_slots[i].owner == array && temp_slots[i].index >= first) {
+            temp_slot_free(i);
+        }
     }
-    state->temp_slot = -1;
-    state_flag_set(setting, ZMK_CUSTOM_SETTING_STATE_TEMPORARY_ACTIVE, false);
 }
 
 static bool setting_is_dirty(const struct zmk_custom_setting *setting) {
     if (zmk_custom_setting_is_array(setting) &&
         setting->array_index != ZMK_CUSTOM_SETTING_ARRAY_NONE) {
-        return *array_dirty_slot(setting);
+        return array_flag_get(setting->array_state->dirty, setting->array_index);
     }
 
     return state_flag(setting, ZMK_CUSTOM_SETTING_STATE_DIRTY);
@@ -405,7 +400,7 @@ static bool setting_is_dirty(const struct zmk_custom_setting *setting) {
 void set_setting_dirty(const struct zmk_custom_setting *setting, bool dirty) {
     if (zmk_custom_setting_is_array(setting) &&
         setting->array_index != ZMK_CUSTOM_SETTING_ARRAY_NONE) {
-        *array_dirty_slot(setting) = dirty;
+        array_flag_set(setting->array_state->dirty, setting->array_index, dirty);
         return;
     }
 
@@ -415,7 +410,7 @@ void set_setting_dirty(const struct zmk_custom_setting *setting, bool dirty) {
 static bool setting_has_persistent_value(const struct zmk_custom_setting *setting) {
     if (zmk_custom_setting_is_array(setting) &&
         setting->array_index != ZMK_CUSTOM_SETTING_ARRAY_NONE) {
-        return *array_has_persistent_slot(setting);
+        return array_flag_get(setting->array_state->has_persistent, setting->array_index);
     }
 
     return state_flag(setting, ZMK_CUSTOM_SETTING_STATE_HAS_PERSISTENT);
@@ -424,27 +419,21 @@ static bool setting_has_persistent_value(const struct zmk_custom_setting *settin
 static void set_setting_has_persistent_value(const struct zmk_custom_setting *setting, bool value) {
     if (zmk_custom_setting_is_array(setting) &&
         setting->array_index != ZMK_CUSTOM_SETTING_ARRAY_NONE) {
-        *array_has_persistent_slot(setting) = value;
+        array_flag_set(setting->array_state->has_persistent, setting->array_index, value);
         return;
     }
 
     state_flag_set(setting, ZMK_CUSTOM_SETTING_STATE_HAS_PERSISTENT, value);
 }
 
-/*
- * Materialize the current MEMORY value (never a temporary override) as a
- * fixed carrier, or NULL when a blob payload does not fit the carrier
- * (callers must then use zmk_custom_setting_read_into / the raw blob path
- * instead). Array elements are stored as carriers already and are returned
- * in place; a scalar or a carrier-sized blob value is materialized into the
- * shared effective_scratch_value (custom_settings_lock held, like every scratch in
- * this file).
- */
+/* Materialize a carrier only at the compatibility boundary. The returned
+ * scratch value is borrowed until the next read under the settings lock. */
 static const struct zmk_custom_setting_value *
 memory_value_locked(const struct zmk_custom_setting *setting) {
     if (zmk_custom_setting_is_array(setting) &&
         setting->array_index != ZMK_CUSTOM_SETTING_ARRAY_NONE) {
-        return &setting->array_state->values[setting->array_index];
+        array_value_read(setting, setting->array_index, &effective_scratch_value);
+        return &effective_scratch_value;
     }
 
     const struct zmk_custom_setting_state *state = setting->state;
@@ -486,8 +475,9 @@ memory_value_locked(const struct zmk_custom_setting *setting) {
  * override (always carrier-sized) takes precedence over the memory value.
  */
 const struct zmk_custom_setting_value *effective_value(const struct zmk_custom_setting *setting) {
-    if (setting_temporary_active(setting) && setting->state->temp_slot >= 0) {
-        const struct zmk_custom_settings_temp_slot *slot = &temp_slots[setting->state->temp_slot];
+    int index = temp_slot_find(setting);
+    if (index >= 0) {
+        const struct zmk_custom_settings_temp_slot *slot = &temp_slots[index];
         value_from_raw(&temp_scratch_value, slot->type, slot->data, slot->size);
         return &temp_scratch_value;
     }
@@ -615,9 +605,16 @@ static int value_type_validate(const struct zmk_custom_setting *setting,
 
     switch (value->type) {
     case ZMK_CUSTOM_SETTING_VALUE_TYPE_BYTES:
-        return value->size <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE ? 0 : -EMSGSIZE;
+        return value->size <=
+                       MIN(CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE, setting_capacity(setting))
+                   ? 0
+                   : -EMSGSIZE;
     case ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING:
-        return value->size <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE ? 0 : -EMSGSIZE;
+        return value->size <= CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE &&
+                       bounded_strlen(value->string_value, sizeof(value->string_value)) <=
+                           MIN(CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE, setting_capacity(setting))
+                   ? 0
+                   : -EMSGSIZE;
     case ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32:
     case ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL:
         return 0;
@@ -815,11 +812,7 @@ int zmk_custom_setting_set_default(const struct zmk_custom_setting *setting,
      * before settings_load() (i.e. from any SYS_INIT). */
     if (!setting_has_persistent_value(setting) &&
         !state_flag(setting, ZMK_CUSTOM_SETTING_STATE_DIRTY)) {
-        int store_ret = store_scalar_value_locked(setting, value);
-        if (store_ret < 0) {
-            k_mutex_unlock(&custom_settings_lock);
-            return store_ret;
-        }
+        apply_scalar_default_locked(setting);
     }
     k_mutex_unlock(&custom_settings_lock);
 
@@ -832,6 +825,19 @@ int setting_storage_name(const struct zmk_custom_setting *setting, char *name, s
     /* Array element views do not carry a baked-in "key/index" string (there
      * is no per-element registration anymore); build the storage name from
      * the shared array_key plus this view's array_index instead. */
+    if (zmk_custom_setting_keyspace_of(setting)) {
+        const struct zmk_custom_setting_keyspace *owner = setting->_keyspace;
+        uint32_t ordinal = 0;
+        while (ordinal < owner->max_entries && &owner->slots[ordinal].setting != setting) {
+            ++ordinal;
+        }
+        if (ordinal == owner->max_entries) {
+            return -ENOENT;
+        }
+        int written = snprintf(name, name_size, SETTINGS_SUBTREE "/%s/%s#%u",
+                               owner->custom_subsystem_id, owner->key_prefix, ordinal);
+        return written < 0 || written >= name_size ? -ENAMETOOLONG : 0;
+    }
     if (zmk_custom_setting_is_array(setting) &&
         setting->array_index != ZMK_CUSTOM_SETTING_ARRAY_NONE) {
         ret = snprintf(name, name_size, SETTINGS_SUBTREE "/%s/%s/%u", setting->custom_subsystem_id,
@@ -915,6 +921,60 @@ static bool value_matches_default_locked(const struct zmk_custom_setting *settin
 
     const struct zmk_custom_setting_value *memory = memory_value_locked(setting);
     return memory != NULL && value_equals(memory, def);
+}
+
+/* A one-setting PERSIST write has a single publication point: validate
+ * capacity, save the candidate, then install it. No live pointer is moved
+ * before the backend reports success. Scope/array saves remain multi-record. */
+int persist_raw_candidate_locked(const struct zmk_custom_setting *setting, const void *data,
+                                 size_t size) {
+    if (setting_uses_blob_store(setting) && setting->blob.pool) {
+        const struct zmk_custom_setting_large_pool *pool = setting->blob.pool;
+        size_t needed = size + (setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING);
+        size_t others = custom_settings_pool_used(pool) - setting->state->blob.extent;
+        if (needed > pool->size || others > pool->size - needed) {
+            return -ENOSPC;
+        }
+    }
+    char name[SETTINGS_MAX_NAME_LEN];
+    int ret = setting_storage_name(setting, name, sizeof(name));
+    if (ret < 0) {
+        return ret;
+    }
+    const struct zmk_custom_setting_value *def = setting_default_value(setting);
+    bool matches = false;
+    if (!zmk_custom_setting_keyspace_of(setting) && def) {
+        const void *default_data;
+        size_t default_size;
+        /* The BEHAVIOR codec uses a shared scratch; preserve the candidate
+         * before asking it to encode the default. */
+        uint8_t encoded_behavior[BEHAVIOR_VALUE_ENCODED_MAX_SIZE];
+        if (setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_BEHAVIOR) {
+            memcpy(encoded_behavior, data, size);
+            ret = value_to_storage(def, &default_data, &default_size);
+            matches = ret == 0 && size == default_size &&
+                      memcmp(encoded_behavior, default_data, size) == 0;
+            if (!matches) {
+                ret = settings_save_one(name, encoded_behavior, size);
+                if (ret == 0) {
+                    set_setting_has_persistent_value(setting, true);
+                }
+                return ret;
+            }
+        } else {
+            ret = value_to_storage(def, &default_data, &default_size);
+            matches = ret == 0 && size == default_size &&
+                      (size == 0 || memcmp(data, default_data, size) == 0);
+        }
+    }
+    ret = matches ? settings_delete(name) : settings_save_one(name, size ? data : "", size);
+    if (matches && ret == -ENOENT) {
+        ret = 0;
+    }
+    if (ret == 0) {
+        set_setting_has_persistent_value(setting, !matches);
+    }
+    return ret;
 }
 
 int save_setting_locked(const struct zmk_custom_setting *setting) {
@@ -1112,8 +1172,7 @@ static int store_memory_value_locked(const struct zmk_custom_setting *setting,
                                      const struct zmk_custom_setting_value *value) {
     if (zmk_custom_setting_is_array(setting) &&
         setting->array_index != ZMK_CUSTOM_SETTING_ARRAY_NONE) {
-        copy_value(&setting->array_state->values[setting->array_index], value);
-        return 0;
+        return array_value_write(setting, setting->array_index, value);
     }
 
     return store_scalar_value_locked(setting, value);
@@ -1146,8 +1205,7 @@ int write_value_locked(const struct zmk_custom_setting *setting,
         temp_slots[slot].type = value->type;
         temp_slots[slot].size = size;
         memcpy(temp_slots[slot].data, data, size);
-        setting->state->temp_slot = slot;
-        state_flag_set(setting, ZMK_CUSTOM_SETTING_STATE_TEMPORARY_ACTIVE, true);
+
         return 0;
     }
     case ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY: {
@@ -1160,12 +1218,31 @@ int write_value_locked(const struct zmk_custom_setting *setting,
         return 0;
     }
     case ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST: {
-        int ret = store_memory_value_locked(setting, value);
+        if (zmk_custom_setting_is_array(setting)) {
+            int ret = store_memory_value_locked(setting, value);
+            if (ret < 0) {
+                return ret;
+            }
+            clear_temporary_locked(setting);
+            return save_setting_locked(setting);
+        }
+        const void *data;
+        size_t size;
+        int ret = value_to_storage(value, &data, &size);
+        if (ret == 0) {
+            ret = persist_raw_candidate_locked(setting, data, size);
+        }
         if (ret < 0) {
             return ret;
         }
-        clear_temporary_locked(setting);
-        return save_setting_locked(setting);
+        /* Capacity is reserved by the lock; installing a validated candidate
+         * cannot fail after the preceding preflight. */
+        ret = store_memory_value_locked(setting, value);
+        if (ret == 0) {
+            clear_temporary_locked(setting);
+            set_setting_dirty(setting, false);
+        }
+        return ret;
     }
     default:
         return -EINVAL;
@@ -2146,23 +2223,24 @@ static int custom_settings_handle_set(const char *name, size_t len, settings_rea
      * LARGE_VALUE_MAX_SIZE alone to fit that too (see
      * ZMK_CUSTOM_SETTINGS_KEYSPACE_BLOB_SCRATCH_SIZE, which every
      * registered keyspace's own max_key_len/max_size are bounded against). */
-    uint8_t data[ZMK_CUSTOM_SETTINGS_KEYSPACE_BLOB_SCRATCH_SIZE];
+    uint8_t *data = custom_settings_edit_bytes;
     if (setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32) {
         len = sizeof(int32_t);
     } else if (setting->value_type == ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL) {
         len = sizeof(bool);
     }
 
-    if (len > sizeof(data)) {
+    if (len > CUSTOM_SETTINGS_EDIT_SIZE) {
         return -EMSGSIZE;
     }
 
+    k_mutex_lock(&custom_settings_lock, K_FOREVER);
     ssize_t read = read_cb(cb_arg, data, len);
-    if (read < 0) {
-        return read;
+    if (read < 0 || read != len) {
+        k_mutex_unlock(&custom_settings_lock);
+        return read < 0 ? read : -EINVAL;
     }
 
-    k_mutex_lock(&custom_settings_lock, K_FOREVER);
     int ret = value_from_storage(setting, data, read);
     k_mutex_unlock(&custom_settings_lock);
     return ret;
@@ -2212,9 +2290,9 @@ void init_setting_state_locked(const struct zmk_custom_setting *setting) {
          * instead of walking "sibling" registrations. */
         struct zmk_custom_setting_array_state *array_state = setting->array_state;
         for (uint32_t index = 0; index < array_state->max_size; index++) {
-            copy_value(&array_state->values[index], &array_state->defaults[index]);
-            array_state->has_persistent[index] = false;
-            array_state->dirty[index] = false;
+            array_value_default(setting, index);
+            array_flag_set(array_state->has_persistent, index, false);
+            array_flag_set(array_state->dirty, index, false);
         }
         array_state->persistent_size = array_state->default_size;
         array_state->size = array_state->default_size;
@@ -2234,8 +2312,7 @@ void init_setting_state_locked(const struct zmk_custom_setting *setting) {
         state_flag_set(setting, ZMK_CUSTOM_SETTING_STATE_HAS_PERSISTENT, false);
         state_flag_set(setting, ZMK_CUSTOM_SETTING_STATE_DIRTY, false);
     }
-    setting->state->temp_slot = -1;
-    state_flag_set(setting, ZMK_CUSTOM_SETTING_STATE_TEMPORARY_ACTIVE, false);
+    clear_temporary_locked(setting);
     state_flag_set(setting, ZMK_CUSTOM_SETTING_STATE_INITIALIZED, true);
 }
 

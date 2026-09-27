@@ -18,6 +18,7 @@
 #include <zmk/behavior.h>
 #include <zmk/event_manager.h>
 #include <cormoran/zmk/custom_settings.h>
+#include <cormoran/zmk/custom_settings/ref.h>
 #include <zmk/keymap.h>
 #if IS_ENABLED(CONFIG_ZMK_STUDIO_RPC)
 #include <zmk/studio/custom.h>
@@ -39,6 +40,7 @@ struct test_settings_record {
 };
 
 static struct test_settings_record test_settings_storage[TEST_SETTINGS_STORAGE_CAPACITY];
+static bool test_settings_fail_save;
 
 static struct test_settings_record *test_settings_find_record(const char *name) {
     for (size_t i = 0; i < ARRAY_SIZE(test_settings_storage); i++) {
@@ -86,6 +88,10 @@ static int test_settings_load(struct settings_store *cs, const struct settings_l
 
 static int test_settings_save(struct settings_store *cs, const char *name, const char *value,
                               size_t val_len) {
+    if (test_settings_fail_save) {
+        return -EIO;
+    }
+
     ARG_UNUSED(cs);
 
     struct test_settings_record *record = test_settings_find_record(name);
@@ -327,12 +333,11 @@ ZMK_CUSTOM_SETTING_DEFINE(test_bool_probe_setting, "test", "bool_probe",
 
 BUILD_ASSERT(sizeof(struct zmk_custom_setting_state) <= (sizeof(void *) == 4 ? 24 : 40),
              "P4: per-setting RAM state block grew past the design budget");
-BUILD_ASSERT(sizeof(test_bool_probe_setting_store) == 0,
-             "P4: a BOOL setting must not emit a value store buffer");
-BUILD_ASSERT(ZMK_CUSTOM_SETTING_VALUE_STORE_SIZE(ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING,
-                                                 CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE) ==
-                 CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE + 1,
-             "P4: a STRING setting's fixed store must reserve capacity + NUL");
+BUILD_ASSERT(sizeof(test_array_setting_values) == 3 * sizeof(int32_t),
+             "INT32 array storage must contain only typed values");
+BUILD_ASSERT(sizeof(test_array_setting_dirty) == 1, "Array flags must be packed bits");
+BUILD_ASSERT(sizeof(test_array_setting_defaults) == 3 * sizeof(int32_t),
+             "Array defaults must not contain carriers");
 
 /* Simplification P3: an RPC-creatable keyspace for user-created entries
  * under the "macro/" prefix. max_key_len (16) is a keyspace-local limit
@@ -1544,6 +1549,18 @@ static int test_view_pool_temp_slot_leak(void) {
         return -ENOENT;
     }
 
+    /* Reacquisition must recover the same overlay, even after view eviction.
+     * Explicit rollback, not an unrelated lookup, returns the temp budget. */
+    evicted = zmk_custom_setting_find_array_element("test", "view_pool", pool_size);
+    if (!evicted || expect_int_value(evicted, 4242) < 0) {
+        return -EINVAL;
+    }
+    ret = zmk_custom_setting_rollback_temporary(evicted);
+    if (ret < 0) {
+        return ret;
+    }
+    replacement = zmk_custom_setting_find_array_element("test", "view_pool", pool_size + 1);
+
     /* The whole temporary-override pool must be usable again. If the evicted
      * element's slot leaked, one slot stays in_use and the last of these
      * writes fails with -EBUSY. Fillers are scalars (int_value + temp_filler)
@@ -1581,7 +1598,7 @@ static int test_view_pool_temp_slot_leak(void) {
         }
     }
 
-    LOG_INF("PASS: custom_settings_view_pool_temp_slot_leak pool=%u", pool_size);
+    LOG_INF("PASS: custom_settings_view_pool_temp_preserved pool=%u", pool_size);
     return 0;
 }
 
@@ -2315,9 +2332,9 @@ static int test_string_no_truncation(void) {
     }
     /* P4: every STRING setting keeps its value behind a blob buffer now;
      * "non-large" means a carrier-capacity fixed store, not a pool. */
-    if (setting->blob.pool != NULL ||
+    if (setting->blob.pool != &zmk_custom_settings_shared_pool ||
         setting->blob.max_size != CONFIG_ZMK_CUSTOM_SETTINGS_VALUE_MAX_SIZE) {
-        LOG_ERR("String test setting unexpectedly has large/pooled blob store");
+        LOG_ERR("Plain string setting must share the live pool");
         return -EINVAL;
     }
 
@@ -2386,26 +2403,23 @@ static void fill_pool_test_pattern(uint8_t *buf, size_t size, uint8_t seed) {
  * move within the pool at any write that needs more room than it currently
  * has - see pool_ensure_region in custom_settings.c). */
 static int test_large_value_pool(void) {
-    if (test_pooled_a.blob.pool != &test_large_pool || test_pooled_a.state->blob.data != NULL ||
+    if (test_pooled_a.blob.pool != &test_large_pool || test_pooled_a.state->blob.extent != 0 ||
         test_pooled_a.state->blob.size != 0) {
         LOG_ERR("Pooled setting A is not in its expected pre-write state");
         return -EINVAL;
     }
-    if (test_pooled_b.state->blob.data != NULL || test_pooled_b.state->blob.size != 0) {
+    if (test_pooled_b.state->blob.extent != 0 || test_pooled_b.state->blob.size != 0) {
         LOG_ERR("Pooled setting B is not in its expected pre-write state");
         return -EINVAL;
     }
-    /* test_pooled_c's default is an empty STRING, but a STRING's stored NUL
-     * still costs one pool byte even at size 0 (see pool_member_extent) - so
-     * unlike A/B (BYTES, genuinely zero-cost when empty) it already holds a
-     * one-byte region here. Confirm that, then use the actual pool usage as
-     * this test's baseline instead of assuming the pool starts at 0. */
+    /* Unmodified defaults, including a STRING's NUL, borrow ROM and do not
+     * reserve bytes in the live pool. */
     if (test_pooled_c.state->blob.data == NULL || test_pooled_c.state->blob.size != 0) {
         LOG_ERR("Pooled STRING setting C is not in its expected pre-write state");
         return -EINVAL;
     }
     size_t baseline_used = zmk_custom_setting_large_pool_used(&test_large_pool);
-    if (baseline_used != 1) {
+    if (baseline_used != 0) {
         LOG_ERR("Unexpected pool baseline usage: %u", (unsigned)baseline_used);
         return -EINVAL;
     }
@@ -2529,7 +2543,7 @@ static int test_large_value_pool(void) {
         return ret;
     }
     size_t used_after = zmk_custom_setting_large_pool_used(&test_large_pool);
-    if (used_after != used_before - sizeof(payload_a3) || test_pooled_a.state->blob.data != NULL) {
+    if (used_after != used_before - sizeof(payload_a3) || test_pooled_a.state->blob.extent != 0) {
         LOG_ERR("Pool usage did not drop as expected after releasing A: before=%u after=%u",
                 (unsigned)used_before, (unsigned)used_after);
         return -EINVAL;
@@ -2606,12 +2620,13 @@ static int test_large_value_pool(void) {
     ret = zmk_custom_setting_read_into(&test_pooled_c, string_readback, sizeof(string_readback),
                                        &out_size, NULL);
     if (ret < 0 || out_size != 5 || memcmp(string_readback, "hello", 5) != 0 ||
-        string_readback[5] != '\0') {
+        test_pooled_c.state->blob.data[5] != '\0') {
         LOG_ERR("Pool STRING member C corrupted across compaction: ret=%d size=%u", ret,
                 (unsigned)out_size);
         return -EINVAL;
     }
 
+    string_readback[5] = '\0'; /* read_into returns payload bytes, excluding NUL. */
     LOG_INF("PASS: custom_settings_pool_string_member value=%s", string_readback);
 
     /* Leave a clean slate (every pooled test member released) for anything
@@ -2828,6 +2843,172 @@ static int test_initialized_event(void) {
     return 0;
 }
 
+/* Existing consumers may retain old ROM carriers during migration. */
+static const struct zmk_custom_setting_value memory_legacy_defaults[] = {
+    {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING, .size = 6, .string_value = "legacy"}};
+ZMK_CUSTOM_SETTING_ARRAY_DEFINE(memory_legacy, "memory_test", "legacy",
+                                ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING, 1, 1, memory_legacy_defaults,
+                                ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,
+                                ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                                ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                                ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
+
+static const int32_t memory_indices_defaults[32];
+ZMK_CUSTOM_SETTING_ARRAY_DEFINE(memory_indices, "memory_test", "indices",
+                                ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, 32, 32,
+                                memory_indices_defaults,
+                                ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,
+                                ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                                ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                                ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
+
+static const struct zmk_custom_setting_slice memory_strings_defaults[] = {
+    {.data = "alpha", .size = 5}, {.data = "beta", .size = 4}, {.data = "", .size = 0}};
+ZMK_CUSTOM_SETTING_ARRAY_DEFINE(memory_strings, "memory_test", "strings",
+                                ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING, 3, 2, memory_strings_defaults,
+                                ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,
+                                ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                                ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
+                                ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
+
+static int ref_read_value(const struct zmk_custom_setting *setting, void *context) {
+    return zmk_custom_setting_read(setting, context);
+}
+
+static int test_memory_redesign(void) {
+    struct zmk_custom_setting_value value;
+    if (zmk_custom_setting_read_array_by_key("memory_test", "legacy", 0, &value) < 0 ||
+        strcmp(value.string_value, "legacy") != 0) {
+        return -EINVAL;
+    }
+    struct zmk_custom_setting_ref saved[32];
+    for (uint32_t i = 0; i < ARRAY_SIZE(saved); ++i) {
+        const struct zmk_custom_setting *element =
+            zmk_custom_setting_find_array_element("memory_test", "indices", i);
+        if (!element || zmk_custom_setting_ref_capture(element, &saved[i]) < 0) {
+            return -EINVAL;
+        }
+    }
+    for (uint32_t i = 0; i < ARRAY_SIZE(saved); ++i) {
+        if (zmk_custom_setting_ref_visit(&saved[i], ref_read_value, &value) < 0 ||
+            value.type != ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32 || value.int32_value != 0) {
+            LOG_ERR("Saved array ref changed identity at %u", i);
+            return -EINVAL;
+        }
+    }
+    LOG_INF("PASS: custom_settings_ref_32_indices");
+
+    const struct zmk_custom_setting *entry;
+    int ret = zmk_custom_setting_keyspace_create(&test_macro_keyspace, "macro/stale",
+                                                 &ZMK_CUSTOM_SETTING_VALUE_INT32(7),
+                                                 ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY, &entry);
+    struct zmk_custom_setting_ref stale;
+    if (ret < 0 || zmk_custom_setting_ref_capture(entry, &stale) < 0) {
+        return -EINVAL;
+    }
+    if (zmk_custom_setting_keyspace_delete(&test_macro_keyspace, "macro/stale") < 0 ||
+        zmk_custom_setting_keyspace_create(&test_macro_keyspace, "macro/new",
+                                           &ZMK_CUSTOM_SETTING_VALUE_INT32(9),
+                                           ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY, &entry) < 0 ||
+        zmk_custom_setting_ref_visit(&stale, ref_read_value, &value) != -ESTALE) {
+        return -EINVAL;
+    }
+    zmk_custom_setting_keyspace_delete(&test_macro_keyspace, "macro/new");
+    LOG_INF("PASS: custom_settings_ref_rejects_reused_slot");
+
+    /* Variable elements share the scalar pool and retain their own flags.
+     * Insertion/removal rotates node ownership without invalidating links. */
+    struct zmk_custom_setting_value malformed = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING};
+    memset(malformed.string_value, 'x', sizeof(malformed.string_value));
+    if (zmk_custom_setting_write_array_by_key("memory_test", "strings", 0, &malformed,
+                                              ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY) != -EMSGSIZE) {
+        return -EINVAL;
+    }
+    size_t before = zmk_custom_setting_large_pool_used(&zmk_custom_settings_shared_pool);
+    ret = zmk_custom_setting_array_insert_at(&memory_strings, 1,
+                                             &ZMK_CUSTOM_SETTING_VALUE_STRING("inserted"),
+                                             ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY);
+    if (ret < 0 || zmk_custom_setting_read_array_by_key("memory_test", "strings", 2, &value) < 0 ||
+        strcmp(value.string_value, "beta") != 0 ||
+        zmk_custom_setting_large_pool_used(&zmk_custom_settings_shared_pool) != before + 9) {
+        return -EINVAL;
+    }
+    if (zmk_custom_setting_array_remove_at(&memory_strings, 0, NULL,
+                                           ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY) < 0 ||
+        zmk_custom_setting_read_array_by_key("memory_test", "strings", 0, &value) < 0 ||
+        strcmp(value.string_value, "inserted") != 0) {
+        return -EINVAL;
+    }
+    if (zmk_custom_setting_reset(&memory_strings) < 0 ||
+        zmk_custom_setting_large_pool_used(&zmk_custom_settings_shared_pool) != before) {
+        return -EINVAL;
+    }
+    LOG_INF("PASS: custom_settings_typed_string_array");
+
+    /* Aliased input must survive compaction of the source node. */
+    uint8_t expected[100];
+    fill_pool_test_pattern(expected, sizeof(expected), 19);
+    if (zmk_custom_setting_write_bytes(&test_pooled_b, expected, sizeof(expected),
+                                       ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY) < 0) {
+        return -EINVAL;
+    }
+    const uint8_t *alias = test_pooled_b.state->blob.data;
+    ret = zmk_custom_setting_write_bytes(&test_pooled_a, alias, sizeof(expected),
+                                         ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY);
+    /* The shared 192-byte test pool is full enough that this must fail. */
+    if (ret != -ENOSPC || memcmp(test_pooled_b.state->blob.data, expected, sizeof(expected))) {
+        return -EINVAL;
+    }
+    ret = zmk_custom_setting_write_bytes(&test_pooled_b, alias + 10, 50,
+                                         ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY);
+    if (ret < 0 || memcmp(test_pooled_b.state->blob.data, expected + 10, 50)) {
+        return -EINVAL;
+    }
+    alias = test_pooled_b.state->blob.data;
+    ret = zmk_custom_setting_write_bytes(&test_pooled_a, alias, 50,
+                                         ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY);
+    if (ret < 0 || memcmp(test_pooled_a.state->blob.data, expected + 10, 50) ||
+        memcmp(test_pooled_b.state->blob.data, expected + 10, 50)) {
+        return -EINVAL;
+    }
+    LOG_INF("PASS: custom_settings_pool_alias_input");
+
+    const struct zmk_custom_setting *scalar = &test_int_setting;
+    ret = zmk_custom_setting_write(scalar, &ZMK_CUSTOM_SETTING_VALUE_INT32(21),
+                                   ZMK_CUSTOM_SETTING_WRITE_MODE_MEMORY);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = zmk_custom_setting_write(scalar, &ZMK_CUSTOM_SETTING_VALUE_INT32(22),
+                                   ZMK_CUSTOM_SETTING_WRITE_MODE_TEMPORARY);
+    if (ret < 0) {
+        return ret;
+    }
+    test_settings_fail_save = true;
+    ret = zmk_custom_setting_write(scalar, &ZMK_CUSTOM_SETTING_VALUE_INT32(23),
+                                   ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST);
+    test_settings_fail_save = false;
+    if (ret != -EIO || expect_int_value(scalar, 22) < 0 ||
+        zmk_custom_setting_rollback_temporary(scalar) < 0 || expect_int_value(scalar, 21) < 0 ||
+        !zmk_custom_setting_has_unsaved_value(scalar)) {
+        return -EINVAL;
+    }
+    uint8_t original[50];
+    memcpy(original, test_pooled_a.state->blob.data, sizeof(original));
+    uint8_t replacement[70] = {4};
+    test_settings_fail_save = true;
+    ret = zmk_custom_setting_write_bytes(&test_pooled_a, replacement, sizeof(replacement),
+                                         ZMK_CUSTOM_SETTING_WRITE_MODE_PERSIST);
+    test_settings_fail_save = false;
+    if (ret != -EIO || test_pooled_a.state->blob.size != sizeof(original) ||
+        memcmp(test_pooled_a.state->blob.data, original, sizeof(original))) {
+        return -EINVAL;
+    }
+    zmk_custom_setting_reset(scalar);
+    LOG_INF("PASS: custom_settings_persist_failure_preserves_ram");
+    return 0;
+}
+
 static int custom_settings_test_init(void) {
     int ret = test_settings_backend_init();
     if (ret < 0) {
@@ -2936,6 +3117,12 @@ static int custom_settings_test_init(void) {
 
     ret = test_initialized_event();
     if (ret < 0) {
+        return ret;
+    }
+
+    ret = test_memory_redesign();
+    if (ret < 0) {
+        LOG_ERR("Memory redesign test failed: %d", ret);
         return ret;
     }
 

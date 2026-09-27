@@ -40,7 +40,7 @@ class WestCommandsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.WEST_TOPDIR = Path(run_west(["topdir"]).stdout.strip())
-        cls.BUILD_DIR = cls.WEST_TOPDIR / "build"
+        cls.BUILD_DIR = THIS_DIR / "build"
 
     @unittest.skipUnless(
         platform.system() == "Linux", "zmk-test is only supported on Linux"
@@ -237,7 +237,19 @@ class WestCommandsTests(unittest.TestCase):
         for artifact in artifacts_and_expected_build_params.keys():
             shutil.rmtree(self.BUILD_DIR / artifact, ignore_errors=True)
 
-        result = run_west(["zmk-build", "tests/zmk-config", "-q"])
+        result = run_west(
+            [
+                "zmk-build",
+                "tests/zmk-config",
+                "-m",
+                ".",
+                "-d",
+                str(self.BUILD_DIR),
+                "-q",
+                "-P",
+                "4",
+            ]
+        )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
         for artifact, entries in artifacts_and_expected_build_params.items():
