@@ -14,7 +14,7 @@ struct zmk_custom_setting {
     const char *array_key;
     uint32_t array_index; /* ARRAY_NONE on registered parents; index on scoped views. */
     uint8_t value_type;
-    uint8_t confidentiality : 2, is_array : 1;
+    uint8_t confidentiality;
     uint8_t read_permission : 4, write_permission : 4;
     uint8_t constraints_count;
     const struct zmk_custom_setting_constraint *constraints;

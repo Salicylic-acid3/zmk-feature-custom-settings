@@ -16,6 +16,11 @@ ZMK_CUSTOM_SETTING_DEFINE(compact_number, "compact", "number", ZMK_CUSTOM_SETTIN
 ZMK_CUSTOM_SETTING_DEFINE(compact_text, "compact", "text", ZMK_CUSTOM_SETTING_VALUE_TYPE_STRING,
                           ZMK_CUSTOM_SETTING_VALUE_STRING("hello"), PUBLIC, OPEN, OPEN,
                           ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
+#ifdef CONFIG_ZMK_CUSTOM_SETTINGS_LEGACY_COMPAT
+/* Existing consumers may take the address of this legacy byte field. */
+static const uint8_t *const legacy_permission_field __unused = &compact_number.confidentiality;
+BUILD_ASSERT(sizeof(void *) != 4 || sizeof(struct zmk_custom_setting) == 52);
+#endif
 #if IS_ENABLED(CONFIG_ZMK_CUSTOM_SETTINGS_ARRAY)
 static const int32_t defaults[] = {1, 2, 3};
 ZMK_CUSTOM_SETTING_ARRAY_DEFINE(compact_array, "compact", "array",
