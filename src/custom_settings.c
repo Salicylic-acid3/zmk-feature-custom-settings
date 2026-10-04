@@ -1484,6 +1484,28 @@ static int apply_scope_to_setting(const struct zmk_custom_setting *setting,
                 (*count)++;
             }
         }
+
+        /* The element views cover the elements; the array's *size* is the
+         * descriptor's. Two cases the loop above cannot reach: an array
+         * emptied in memory (every element popped) has no active element,
+         * so a save never wrote the "_size" marker nor deleted the stored
+         * elements, and they came back on the next boot -- removing the
+         * last tap of a tap dance and saving did nothing; and a discard on
+         * element views restores values but not the size, so a popped
+         * element stayed popped after "discard". Every callback handles the
+         * descriptor (save writes the whole array, discard and reset
+         * restore the size), so when the size still differs from what is
+         * persisted, call it there too. Not counted: affected_count stays
+         * one per element. */
+        k_mutex_lock(&custom_settings_lock, K_FOREVER);
+        bool size_pending = setting->array_state->size != setting->array_state->persistent_size;
+        k_mutex_unlock(&custom_settings_lock);
+        if (size_pending) {
+            int ret = callback(setting);
+            if (ret < 0 && *first_error == 0) {
+                *first_error = ret;
+            }
+        }
         return 0;
     }
 
