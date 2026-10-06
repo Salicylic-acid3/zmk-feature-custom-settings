@@ -231,6 +231,18 @@ config ZMK_CUSTOM_SETTINGS_RPC_CONVERTERS
       stored form and its RPC form. Disable to shrink firmware when no setting
       uses a converter (values pass through unchanged).
 
+config ZMK_CUSTOM_SETTINGS_STORAGE_REPORT
+    bool "Publish how full the settings storage is"
+    default y
+    depends on SETTINGS_NVS && ZMK_CUSTOM_SETTINGS_STUDIO_RPC
+    help
+      Publishes the settings partition's size and NVS's estimate of the
+      space still free as two temporary INT32 settings
+      (storage_total_bytes / storage_free_bytes) under this module's own
+      subsystem, refreshed after every save and once a minute. A full NVS
+      refuses every new save without any other sign; this is the sign.
+      Uses two slots of the temporary pool (ZMK_CUSTOM_SETTINGS_TEMP_SLOTS).
+
 config ZMK_CUSTOM_SETTINGS_RECORD
     bool "Enable record/struct settings (TLV codec)"
     default y
