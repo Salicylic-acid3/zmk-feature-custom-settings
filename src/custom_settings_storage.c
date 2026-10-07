@@ -25,6 +25,18 @@
  * The free figure is NVS's own estimate (nvs_calc_free_space), which keeps
  * one sector in reserve for garbage collection; it is the space a new
  * record can actually take, not the raw unused flash.
+ *
+ * That estimate is not cheap. nvs_calc_free_space walks every allocation
+ * entry in the partition and, for each, walks back again to see whether a
+ * newer entry supersedes it: quadratic in the number of entries, and a
+ * partition that has seen thousands of saves holds thousands of entries.
+ * On ClickBoard ErgoTrack that was two to three seconds of flash reads --
+ * and the first version ran it on the system work queue, which is
+ * cooperative, so for those seconds nothing else on it ran: no key events,
+ * no pointer, no advertising start after boot. It runs on ZMK's low-priority
+ * work queue now, where everything else preempts it, and rarely: once after
+ * boot, a few seconds after a save, and every ten minutes for what writes
+ * around this module.
  */
 
 #include <zephyr/kernel.h>
@@ -34,6 +46,7 @@
 #include <zephyr/logging/log.h>
 
 #include <zmk/event_manager.h>
+#include <zmk/workqueue.h>
 #include <cormoran/zmk/custom_settings.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -54,10 +67,14 @@ ZMK_CUSTOM_SETTING_DEFINE(custom_settings_storage_free, STORAGE_SUBSYS, "storage
                           ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,
                           ZMK_CUSTOM_SETTING_PERMISSION_SECURE, ZMK_CUSTOM_SETTING_NO_CONSTRAINT);
 
-/* A save a second apart is one refresh, not two; and the keymap and bonds
- * write around this module, so the timer catches those. */
-#define STORAGE_REPORT_DEBOUNCE K_MSEC(500)
-#define STORAGE_REPORT_PERIOD K_SECONDS(60)
+/* Several saves a few seconds apart are one refresh, not several; the boot
+ * delay keeps the walk off the path that brings the radio up; and the keymap
+ * and bonds write around this module, so the slow timer catches those. */
+#define STORAGE_REPORT_BOOT_DELAY K_SECONDS(10)
+#define STORAGE_REPORT_DEBOUNCE K_SECONDS(3)
+#define STORAGE_REPORT_PERIOD K_MINUTES(10)
+
+static void storage_report_schedule(k_timeout_t delay);
 
 static void publish(const struct zmk_custom_setting *setting, int32_t number) {
     const struct zmk_custom_setting_value value = {
@@ -95,19 +112,25 @@ static K_WORK_DELAYABLE_DEFINE(storage_report_work, storage_report_work_cb);
 static void storage_report_work_cb(struct k_work *work) {
     ARG_UNUSED(work);
     storage_report_refresh();
-    k_work_reschedule(&storage_report_work, STORAGE_REPORT_PERIOD);
+    storage_report_schedule(STORAGE_REPORT_PERIOD);
+}
+
+/* Always the low-priority queue: see the file comment for why never the
+ * system one. */
+static void storage_report_schedule(k_timeout_t delay) {
+    k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &storage_report_work, delay);
 }
 
 static int storage_report_listener(const zmk_event_t *eh) {
     if (as_zmk_custom_settings_initialized(eh) != NULL) {
-        k_work_reschedule(&storage_report_work, STORAGE_REPORT_DEBOUNCE);
+        storage_report_schedule(STORAGE_REPORT_BOOT_DELAY);
         return ZMK_EV_EVENT_BUBBLE;
     }
 
     const struct zmk_custom_setting_changed *changed = as_zmk_custom_setting_changed(eh);
     if (changed != NULL && (changed->kind == ZMK_CUSTOM_SETTING_CHANGED_SAVED ||
                             changed->kind == ZMK_CUSTOM_SETTING_CHANGED_RESET)) {
-        k_work_reschedule(&storage_report_work, STORAGE_REPORT_DEBOUNCE);
+        storage_report_schedule(STORAGE_REPORT_DEBOUNCE);
     }
     return ZMK_EV_EVENT_BUBBLE;
 }
