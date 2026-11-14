@@ -25,6 +25,7 @@
 #include <stddef.h>
 
 #include <zephyr/kernel.h>
+#include <zephyr/settings/settings.h>
 
 #include <cormoran/zmk/custom_settings.h>
 
@@ -33,6 +34,21 @@
  * split_array_size_key) to agree on the on-flash key layout. */
 #define SETTINGS_SUBTREE "custom_settings"
 #define ARRAY_SIZE_STORAGE_KEY "_size"
+
+/* Room for a full storage name ("custom_settings/<subsystem>/<key>[/<index>
+ * or /_size]"), sized the way the settings backends size their own name
+ * buffers (settings_nvs.c, settings_zms.c, settings_fcb.c all read a name
+ * into SETTINGS_MAX_NAME_LEN + SETTINGS_EXTRA_LEN + 1 bytes).
+ *
+ * These buffers used to be SETTINGS_MAX_NAME_LEN (64) bytes, i.e. names of
+ * at most 63 characters, ten short of what the backend stores and loads.
+ * A name that did not fit made the save return -ENAMETOOLONG, which the
+ * Studio handler reports as "Failed to process request". It bit the first
+ * array whose name crossed the line:
+ *   custom_settings/keebon__runtime_tap_dance/tap_dance0/holds/_size
+ * is exactly 64 characters (".../taps/_size" is 63 and saved fine), so a
+ * tap dance's taps were stored and its hold actions never were. */
+#define STORAGE_NAME_BUF_SIZE (SETTINGS_MAX_NAME_LEN + SETTINGS_EXTRA_LEN + 1)
 
 /* The single lock serializing all custom-settings state access. Defined
  * (non-static) in custom_settings.c so every feature translation unit can

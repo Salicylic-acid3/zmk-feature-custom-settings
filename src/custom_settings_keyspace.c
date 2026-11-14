@@ -470,7 +470,7 @@ int zmk_custom_setting_keyspace_delete(struct zmk_custom_setting_keyspace *keysp
     /* Erase the persisted record (if any) the same way a scalar setting's
      * reset does, then release the slot. Ignore -ENOENT from a setting that
      * was never saved. */
-    char name[SETTINGS_MAX_NAME_LEN];
+    char name[STORAGE_NAME_BUF_SIZE];
     int ret = setting_storage_name(setting, name, sizeof(name));
     if (ret == 0) {
         ret = settings_delete(name);

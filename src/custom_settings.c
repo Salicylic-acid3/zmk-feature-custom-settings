@@ -929,7 +929,7 @@ int save_setting_locked(const struct zmk_custom_setting *setting) {
         return save_array_locked(setting);
     }
 
-    char name[SETTINGS_MAX_NAME_LEN];
+    char name[STORAGE_NAME_BUF_SIZE];
     int ret = setting_storage_name(setting, name, sizeof(name));
     if (ret < 0) {
         return ret;
@@ -1302,7 +1302,7 @@ int zmk_custom_setting_discard(const struct zmk_custom_setting *const_setting) {
          * persisted value from flash straight into the memory store.
          * Discard is a rare, explicit user action, so a flash read here is
          * fine. */
-        char name[SETTINGS_MAX_NAME_LEN];
+        char name[STORAGE_NAME_BUF_SIZE];
         int ret = setting_storage_name(setting, name, sizeof(name));
         if (ret == 0) {
             ret = settings_load_subtree(name);
@@ -1343,7 +1343,7 @@ int zmk_custom_setting_reset(const struct zmk_custom_setting *const_setting) {
                 ret = reset_array_element_locked(view);
             }
             if (ret == 0) {
-                char size_name[SETTINGS_MAX_NAME_LEN];
+                char size_name[STORAGE_NAME_BUF_SIZE];
                 ret = array_size_storage_name(setting, size_name, sizeof(size_name));
                 if (ret == 0) {
                     ret = settings_delete(size_name);
@@ -1361,7 +1361,7 @@ int zmk_custom_setting_reset(const struct zmk_custom_setting *const_setting) {
              * apply_scope. */
             ret = reset_array_element_locked(setting);
             if (ret == 0) {
-                char size_name[SETTINGS_MAX_NAME_LEN];
+                char size_name[STORAGE_NAME_BUF_SIZE];
                 int size_ret = array_size_storage_name(setting, size_name, sizeof(size_name));
                 if (size_ret == 0) {
                     size_ret = settings_delete(size_name);
@@ -1385,7 +1385,7 @@ int zmk_custom_setting_reset(const struct zmk_custom_setting *const_setting) {
         return ret;
     }
 
-    char name[SETTINGS_MAX_NAME_LEN];
+    char name[STORAGE_NAME_BUF_SIZE];
     int ret = setting_storage_name(setting, name, sizeof(name));
     if (ret < 0) {
         return ret;

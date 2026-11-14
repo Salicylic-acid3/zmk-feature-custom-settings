@@ -247,7 +247,7 @@ static int delete_inactive_array_values_locked(const struct zmk_custom_setting *
 
         struct zmk_custom_setting *view =
             array_view_acquire((struct zmk_custom_setting *)array_descriptor, index);
-        char name[SETTINGS_MAX_NAME_LEN];
+        char name[STORAGE_NAME_BUF_SIZE];
         int ret = setting_storage_name(view, name, sizeof(name));
         if (ret < 0) {
             return ret;
@@ -272,7 +272,7 @@ static int delete_inactive_array_values_locked(const struct zmk_custom_setting *
  * (custom_settings.c) calls this directly for an array setting. Declared in
  * custom_settings_internal.h. */
 int save_array_locked(const struct zmk_custom_setting *array_descriptor) {
-    char size_name[SETTINGS_MAX_NAME_LEN];
+    char size_name[STORAGE_NAME_BUF_SIZE];
     int ret = array_size_storage_name(array_descriptor, size_name, sizeof(size_name));
     if (ret < 0) {
         return ret;
@@ -288,7 +288,7 @@ int save_array_locked(const struct zmk_custom_setting *array_descriptor) {
     for (uint32_t index = 0; index < array_size; index++) {
         struct zmk_custom_setting *view =
             array_view_acquire((struct zmk_custom_setting *)array_descriptor, index);
-        char name[SETTINGS_MAX_NAME_LEN];
+        char name[STORAGE_NAME_BUF_SIZE];
         ret = setting_storage_name(view, name, sizeof(name));
         if (ret < 0) {
             return ret;
@@ -620,7 +620,7 @@ int discard_array_element_locked(struct zmk_custom_setting *view) {
          * persisted value from flash straight into the buffer slot.
          * Discard is a rare, explicit user action, so a flash read here is
          * fine. */
-        char name[SETTINGS_MAX_NAME_LEN];
+        char name[STORAGE_NAME_BUF_SIZE];
         int ret = setting_storage_name(view, name, sizeof(name));
         if (ret == 0) {
             ret = settings_load_subtree(name);
@@ -645,7 +645,7 @@ int reset_array_element_locked(struct zmk_custom_setting *view) {
     struct zmk_custom_setting_array_state *array_state = view->array_state;
     uint32_t index = view->array_index;
 
-    char name[SETTINGS_MAX_NAME_LEN];
+    char name[STORAGE_NAME_BUF_SIZE];
     int ret = setting_storage_name(view, name, sizeof(name));
     if (ret < 0) {
         return ret;
